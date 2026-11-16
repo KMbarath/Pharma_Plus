@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 360" fill="none">
+  <ellipse cx="180" cy="315" rx="102" ry="15" fill="#D9E1C5"/>
+  <rect x="131" y="46" width="98" height="43" rx="11" fill="#83B900"/>
+  <path d="M143 82h74l18 30v166c0 14-11 25-25 25h-60c-14 0-25-11-25-25V112l18-30Z" fill="#FFFDF8" stroke="#D8DDCF" stroke-width="4"/>
+  <path d="M127 139h106v112H127z" rx="9" fill="#F1F6E6"/>
+  <path d="M180 154c-19 0-34 15-34 34 0 24 34 50 34 50s34-26 34-50c0-19-15-34-34-34Z" fill="#83B900"/>
+  <path d="M180 167c-8 9-13 17-13 24 0 8 6 14 13 14s13-6 13-14c0-7-5-15-13-24Z" fill="#fff"/>
+  <text x="180" y="226" text-anchor="middle" fill="#536B29" font-family="Arial,sans-serif" font-size="16" font-weight="700">BIOTIN</text>
+  <text x="180" y="244" text-anchor="middle" fill="#7B816F" font-family="Arial,sans-serif" font-size="9">60 CAPSULES</text>
+</svg>

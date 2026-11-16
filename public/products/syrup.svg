@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 360" fill="none">
+  <ellipse cx="180" cy="315" rx="102" ry="15" fill="#E5D6C6"/>
+  <rect x="144" y="43" width="72" height="48" rx="10" fill="#5B5B55"/>
+  <path d="M153 82h54l19 28v167c0 16-12 28-28 28h-36c-16 0-28-12-28-28V110l19-28Z" fill="#A85B3D" stroke="#8E4B33" stroke-width="4"/>
+  <rect x="137" y="139" width="86" height="113" rx="10" fill="#FFF8E9"/>
+  <path d="M151 158h58v11h-58zm0 69h58v8h-58z" fill="#E7D7BE"/>
+  <circle cx="180" cy="196" r="20" fill="#75845D"/>
+  <path d="M181 180c-10 14-13 21-13 27 0 7 6 12 13 12s13-5 13-12c0-6-3-13-13-27Z" fill="#F1F6E6"/>
+  <text x="180" y="244" text-anchor="middle" fill="#3C382F" font-family="Arial,sans-serif" font-size="11" font-weight="700">COUGH CARE</text>
+</svg>

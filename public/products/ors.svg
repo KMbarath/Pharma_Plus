@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 360" fill="none">
+  <ellipse cx="180" cy="315" rx="100" ry="15" fill="#DCE5C9"/>
+  <path d="m122 79 116 11-14 195-116-11 14-195Z" fill="#FFFDF5" stroke="#E0E2D5" stroke-width="4"/>
+  <path d="m125 101 108 10-5 74-108-10 5-74Z" fill="#83B900"/>
+  <path d="m120 197 106 10-4 60-106-10 4-60Z" fill="#F1F6E6"/>
+  <path d="M174 122c-11 20-16 30-16 40 0 12 9 21 21 21s21-9 21-21c0-10-5-20-16-40l-5-8-5 8Z" fill="#fff"/>
+  <text x="176" y="229" text-anchor="middle" fill="#536B29" font-family="Arial,sans-serif" font-size="17" font-weight="700">ORS</text>
+  <text x="176" y="247" text-anchor="middle" fill="#7B816F" font-family="Arial,sans-serif" font-size="9">ELECTROLYTES</text>
+</svg>
