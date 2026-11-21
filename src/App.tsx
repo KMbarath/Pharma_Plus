@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react'
 import { motion } from 'framer-motion'
 import {
   ArrowDownUp,
@@ -9,7 +9,6 @@ import {
   BellRing,
   Camera,
   Check,
-  CircleUserRound,
   Heart,
   Home,
   Minus,
@@ -35,6 +34,8 @@ import {
   CalendarDays,
   Package,
   CircleCheck,
+  Pencil,
+  Trash2,
 } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 import { BrowserRouter, NavLink, Route, Routes, useLocation, useNavigate, useParams } from 'react-router-dom'
@@ -58,6 +59,87 @@ type CartItem = Product & {
   quantity: number
 }
 
+type InventoryRecord = {
+  id: number
+  name: string
+  category: string
+  pack: string
+  price: number
+  stock: number
+  reorderLevel: number
+  expiry: string | null
+  sku: string | null
+  genericName: string | null
+  manufacturer: string | null
+  batchNumber: string | null
+  gstRate: number
+  hsnCode: string | null
+  prescriptionRequired: boolean
+  description: string | null
+  imageUrl: string | null
+  available: boolean
+}
+
+type MedicineForm = {
+  name: string
+  category: string
+  pack: string
+  price: string
+  stock: string
+  reorderLevel: string
+  expiry: string
+  sku: string
+  genericName: string
+  manufacturer: string
+  batchNumber: string
+  gstRate: string
+  hsnCode: string
+  prescriptionRequired: boolean
+  description: string
+  imageUrl: string
+}
+
+type OwnerSession = {
+  email: string
+  token: string
+}
+
+type OwnerAuthStatus = {
+  ownerConfigured: boolean
+  canSetupOwner: boolean
+}
+
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? ''
+const apiUrl = (path: string) => `${API_BASE_URL}${path}`
+
+function ownerApiFetch(path: string, token: string, init: RequestInit = {}) {
+  const headers = new Headers(init.headers)
+  headers.set('Authorization', `Bearer ${token}`)
+  return fetch(apiUrl(path), {
+    ...init,
+    headers,
+  })
+}
+
+const emptyMedicineForm = (): MedicineForm => ({
+  name: '',
+  category: '',
+  pack: '',
+  price: '',
+  stock: '0',
+  reorderLevel: '10',
+  expiry: '',
+  sku: '',
+  genericName: '',
+  manufacturer: '',
+  batchNumber: '',
+  gstRate: '0',
+  hsnCode: '',
+  prescriptionRequired: false,
+  description: '',
+  imageUrl: '',
+})
+
 const categories = [
   { name: 'Tablets', icon: '💊' },
   { name: 'Capsules', icon: '🧴' },
@@ -68,61 +150,6 @@ const categories = [
   { name: 'Sprays', icon: '🧪' },
   { name: 'Vitamins', icon: '🌿' },
   { name: 'Medical Devices', icon: '🩺' },
-]
-
-const products: Product[] = [
-  {
-    id: 1,
-    name: 'Biotin For Beauty',
-    category: 'Hair & Skin',
-    pack: '60 Capsules',
-    price: 1499,
-    originalPrice: 1899,
-    image: '/products/biotin.svg',
-    rating: 4.9,
-    description:
-      'Biotin support for healthy hair, skin and nail vitality. Crafted with essential nutrients to help sustain energy, strength and beauty from within.',
-    badge: '12% OFF',
-  },
-  {
-    id: 2,
-    name: 'Cough Relief Syrup',
-    category: 'Syrup',
-    pack: '200 ml',
-    price: 399,
-    image: '/products/syrup.svg',
-    rating: 4.7,
-    description:
-      'Soothing dual-action syrup formulated to relieve cough and throat irritation with a smooth, non-drowsy profile for everyday comfort.',
-  },
-  {
-    id: 3,
-    name: 'Vitamin C Plus',
-    category: 'Vitamins',
-    pack: '30 Tablets',
-    price: 699,
-    image: '/products/vitamin-c.svg',
-    rating: 4.8,
-    description:
-      'A daily immunity-support blend with vitamin C and zinc to help protect, recharge and restore wellness for active lifestyles.',
-    badge: 'New',
-  },
-  {
-    id: 4,
-    name: 'ORS Electrolyte',
-    category: 'Hydration',
-    pack: '20 sachets',
-    price: 260,
-    image: '/products/ors.svg',
-    rating: 4.6,
-    description:
-      'Balanced rehydration support with essential electrolytes for recovery after exertion, illness or travel-related dehydration.',
-  },
-]
-
-const initialCart: CartItem[] = [
-  { ...products[0], quantity: 1 },
-  { ...products[2], quantity: 1 },
 ]
 
 const chartData = [
@@ -182,11 +209,51 @@ const demoOrders = [
 ]
 
 function App() {
-  const [cart, setCart] = useState<CartItem[]>(initialCart)
+  const [cart, setCart] = useState<CartItem[]>([])
+  const [products, setProducts] = useState<Product[]>([])
+  const [storeCategories, setStoreCategories] = useState(categories)
+  const [catalogError, setCatalogError] = useState('')
   const [selectedCategory, setSelectedCategory] = useState('Tablets')
   const [paymentMethod, setPaymentMethod] = useState('Cash on Delivery')
   const [orderPlaced, setOrderPlaced] = useState(false)
-  const [favoriteIds, setFavoriteIds] = useState<number[]>([1, 3])
+  const [favoriteIds, setFavoriteIds] = useState<number[]>([])
+
+  const refreshCatalog = async () => {
+    try {
+      const [medicinesResponse, categoriesResponse] = await Promise.all([
+        fetch(apiUrl('/api/catalog/medicines')),
+        fetch(apiUrl('/api/catalog/categories')),
+      ])
+      const [medicinesResult, categoriesResult] = await Promise.all([
+        medicinesResponse.json(),
+        categoriesResponse.json(),
+      ])
+      if (!medicinesResponse.ok) throw new Error(medicinesResult.error || 'Could not load the medicine catalog.')
+      if (!categoriesResponse.ok) throw new Error(categoriesResult.error || 'Could not load medicine categories.')
+      setProducts((medicinesResult as InventoryRecord[]).map((item) => ({
+        id: item.id,
+        name: item.name,
+        category: item.category,
+        pack: item.pack,
+        price: item.price,
+        image: item.imageUrl || '/pharma-plus-icon.png',
+        description: item.description || '',
+      })))
+      setStoreCategories((categoriesResult as Array<{ name: string }>).map(({ name }) => ({
+        name,
+        icon: categories.find((category) => category.name === name)?.icon ?? '💊',
+      })))
+      setCatalogError('')
+    } catch (requestError) {
+      setCatalogError(requestError instanceof Error ? requestError.message : 'Could not load the medicine catalog.')
+    }
+  }
+
+  useEffect(() => {
+    // Load the catalog from the PostgreSQL-backed API when the app mounts.
+    // oxlint-disable-next-line react/set-state-in-effect
+    void refreshCatalog()
+  }, [])
 
   const subtotal = useMemo(
     () => cart.reduce((sum, item) => sum + item.quantity * item.price, 0),
@@ -236,12 +303,13 @@ function App() {
               path="/"
               element={
                 <CustomerHomePage
-                  categories={categories}
+                  categories={storeCategories}
                   products={products}
                   selectedCategory={selectedCategory}
                   onSelectCategory={setSelectedCategory}
                   favoriteIds={favoriteIds}
                   onToggleFavorite={toggleFavorite}
+                  catalogError={catalogError}
                 />
               }
             />
@@ -283,7 +351,7 @@ function App() {
                 />
               }
             />
-            <Route path="/dashboard/:section?" element={<DashboardPage />} />
+            <Route path="/dashboard/:section?" element={<DashboardPage onCatalogChange={() => void refreshCatalog()} />} />
           </Routes>
         </div>
       </div>
@@ -310,6 +378,7 @@ function CustomerHomePage({
   onSelectCategory,
   favoriteIds,
   onToggleFavorite,
+  catalogError,
 }: {
   categories: Array<{ name: string; icon: string }>
   products: Product[]
@@ -317,6 +386,7 @@ function CustomerHomePage({
   onSelectCategory: (value: string) => void
   favoriteIds: number[]
   onToggleFavorite: (productId: number) => void
+  catalogError: string
 }) {
   const navigate = useNavigate()
   const [greeting] = useState(() => {
@@ -383,8 +453,9 @@ function CustomerHomePage({
       <section className="section-block">
         <div className="section-header">
           <h3>Best Products</h3>
-          <button>See All</button>
+          <span>{products.length} items</span>
         </div>
+        {catalogError && <p className="owner-form-error" role="alert">{catalogError}</p>}
         <div className="product-row horizontal-scroll">
           {products.map((product) => (
             <motion.article
@@ -417,6 +488,7 @@ function CustomerHomePage({
               </div>
             </motion.article>
           ))}
+          {products.length === 0 && !catalogError && <p className="empty-state-card compact-empty">No medicines are listed yet. The pharmacy owner can add products from the dashboard.</p>}
         </div>
       </section>
 
@@ -605,8 +677,18 @@ function ProductDetailPage({
 }) {
   const navigate = useNavigate()
   const { id } = useParams()
-  const product = products.find((item) => item.id === Number(id)) ?? products[0]
+  const product = products.find((item) => item.id === Number(id))
   const [quantity, setQuantity] = useState(1)
+
+  if (!product) {
+    return (
+      <div className="empty-state-card">
+        <h2>Medicine not found</h2>
+        <p>This medicine may no longer be available.</p>
+        <button className="accept-action" onClick={() => navigate('/')}>Back to medicines</button>
+      </div>
+    )
+  }
 
   return (
     <motion.div initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -18 }} className="screen details-screen">
@@ -842,14 +924,144 @@ function CheckoutPage({
   )
 }
 
-function DashboardPage() {
+function OwnerAccessPage({
+  status,
+  error: connectionError,
+  onAuthenticated,
+}: {
+  status: OwnerAuthStatus | null
+  error: string
+  onAuthenticated: (session: OwnerSession) => void
+}) {
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [confirmation, setConfirmation] = useState('')
+  const [requestError, setRequestError] = useState('')
+  const [busy, setBusy] = useState(false)
+  const isSetup = status?.ownerConfigured === false
+
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (isSetup && password !== confirmation) {
+      setRequestError('The passwords do not match.')
+      return
+    }
+    setBusy(true)
+    setRequestError('')
+    try {
+      const response = await fetch(apiUrl(isSetup ? '/api/auth/setup' : '/api/auth/login'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password }),
+      })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.error || 'Could not sign in.')
+      const session = result as OwnerSession
+      localStorage.setItem('pharma-plus-owner-token', session.token)
+      onAuthenticated(session)
+    } catch (requestError) {
+      setRequestError(requestError instanceof Error ? requestError.message : 'Could not sign in.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <main className="screen owner-auth-screen">
+      <section className="owner-auth-card">
+        <div className="brand-mark">P+</div>
+        <p className="eyebrow">PHARMA PLUS OWNER</p>
+        <h1>{isSetup ? 'Set up owner access' : 'Owner sign in'}</h1>
+        <p>{isSetup ? 'Create the first owner account from this Mac. Use a unique password with at least 12 characters.' : 'Sign in to manage your pharmacy inventory.'}</p>
+        {connectionError && <p className="owner-form-error" role="alert">{connectionError}</p>}
+        {status?.ownerConfigured === false && !status.canSetupOwner ? (
+          <p className="owner-form-error" role="alert">Create the first owner account on the Mac before signing in from this phone.</p>
+        ) : status ? (
+          <form onSubmit={submit} className="owner-auth-form">
+            <label>Email<input type="email" autoComplete="username" required value={email} onChange={(event) => setEmail(event.target.value)} /></label>
+            <label>Password<input type="password" autoComplete={isSetup ? 'new-password' : 'current-password'} minLength={isSetup ? 12 : undefined} required value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+            {isSetup && <label>Confirm password<input type="password" autoComplete="new-password" minLength={12} required value={confirmation} onChange={(event) => setConfirmation(event.target.value)} /></label>}
+            {requestError && <p className="owner-form-error" role="alert">{requestError}</p>}
+            <button type="submit" className="accept-action" disabled={busy}>{busy ? 'Please wait…' : isSetup ? 'Create owner account' : 'Sign in'}</button>
+          </form>
+        ) : null}
+      </section>
+    </main>
+  )
+}
+
+function DashboardPage({ onCatalogChange }: { onCatalogChange: () => void }) {
   const { section } = useParams()
   const activeSection = section ?? 'home'
+  const [authStatus, setAuthStatus] = useState<OwnerAuthStatus | null>(null)
+  const [ownerSession, setOwnerSession] = useState<OwnerSession | null>(null)
+  const [authReady, setAuthReady] = useState(false)
+  const [authError, setAuthError] = useState('')
   const sectionTitles: Record<string, string> = {
     home: 'Good Morning, Arun',
     orders: 'Orders',
     medicines: 'Medicines',
     delivery: 'Delivery',
+  }
+
+  useEffect(() => {
+    let cancelled = false
+    const checkOwnerAccess = async () => {
+      try {
+        const statusResponse = await fetch(apiUrl('/api/auth/status'))
+        const status = await statusResponse.json()
+        if (!statusResponse.ok) throw new Error(status.error || 'Could not check owner access.')
+        if (cancelled) return
+        setAuthStatus(status as OwnerAuthStatus)
+
+        const token = localStorage.getItem('pharma-plus-owner-token')
+        if (token) {
+          const sessionResponse = await ownerApiFetch('/api/auth/session', token)
+          if (sessionResponse.ok) {
+            const session = await sessionResponse.json()
+            if (!cancelled) setOwnerSession({ token, email: session.email })
+          } else {
+            localStorage.removeItem('pharma-plus-owner-token')
+          }
+        }
+      } catch (requestError) {
+        if (!cancelled) setAuthError(requestError instanceof Error ? requestError.message : 'Could not check owner access.')
+      } finally {
+        if (!cancelled) setAuthReady(true)
+      }
+    }
+    // Load the owner session from the authentication API.
+    // oxlint-disable-next-line react/set-state-in-effect
+    void checkOwnerAccess()
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  const logout = async () => {
+    if (!ownerSession) return
+    try {
+      const response = await ownerApiFetch('/api/auth/logout', ownerSession.token, { method: 'POST' })
+      if (!response.ok) throw new Error('The server could not end the owner session.')
+    } catch (requestError) {
+      setAuthError(requestError instanceof Error ? requestError.message : 'Could not end the owner session.')
+    } finally {
+      localStorage.removeItem('pharma-plus-owner-token')
+      setOwnerSession(null)
+    }
+  }
+
+  if (!authReady) {
+    return <main className="screen owner-auth-screen"><p>Connecting to owner access…</p></main>
+  }
+  if (!ownerSession) {
+    return (
+      <OwnerAccessPage
+        status={authStatus}
+        error={authError}
+        onAuthenticated={(session) => setOwnerSession(session)}
+      />
+    )
   }
 
   return (
@@ -887,7 +1099,8 @@ function DashboardPage() {
             <div className="header-actions">
               <button className="inline-date">Today · 15 Nov</button>
               <button className="icon-button light"><BellRing className="icon" /></button>
-              <div className="mini-profile"><CircleUserRound className="icon" /></div>
+              <span className="owner-email">{ownerSession.email}</span>
+              <button className="quiet-action owner-logout" onClick={() => void logout()}><LogOut className="icon" /> Sign out</button>
             </div>
           </header>
 
@@ -1009,7 +1222,7 @@ function DashboardPage() {
           )}
 
           {activeSection === 'orders' && <PharmacyOrdersScreen />}
-          {activeSection === 'medicines' && <PharmacyMedicinesScreen />}
+          {activeSection === 'medicines' && <PharmacyMedicinesScreen onCatalogChange={onCatalogChange} token={ownerSession.token} />}
           {activeSection === 'delivery' && <PharmacyDeliveryScreen />}
         </main>
       </div>
@@ -1074,37 +1287,177 @@ function PharmacyOrdersScreen() {
   )
 }
 
-function PharmacyMedicinesScreen() {
-  const [inventory, setInventory] = useState([
-    { id: 1, name: 'Biotin For Beauty', category: 'Capsules · 60 count', price: 1499, stock: 24, expiry: 'Aug 2027', available: true },
-    { id: 2, name: 'Cough Relief Syrup', category: 'Syrup · 200 ml', price: 399, stock: 8, expiry: 'Jan 2027', available: true },
-    { id: 3, name: 'Vitamin C Plus', category: 'Tablets · 30 count', price: 699, stock: 0, expiry: 'Mar 2028', available: false },
-  ])
+function PharmacyMedicinesScreen({ onCatalogChange, token }: { onCatalogChange: () => void; token: string }) {
+  const [inventory, setInventory] = useState<InventoryRecord[]>([])
+  const [form, setForm] = useState<MedicineForm | null>(null)
+  const [editingId, setEditingId] = useState<number | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
 
-  const changeStock = (id: number, amount: number) => {
-    setInventory((current) => current.map((item) =>
-      item.id === id ? { ...item, stock: Math.max(0, item.stock + amount), available: item.stock + amount > 0 } : item,
-    ))
+  const loadInventory = useCallback(async () => {
+    try {
+      const response = await ownerApiFetch('/api/medicines', token)
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.error || 'Could not load medicines.')
+      setInventory(result as InventoryRecord[])
+      setError('')
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Could not load medicines.')
+    } finally {
+      setLoading(false)
+    }
+  }, [token])
+
+  useEffect(() => {
+    // This effect synchronizes the screen with inventory stored by the API.
+    // oxlint-disable-next-line react/set-state-in-effect
+    void loadInventory()
+  }, [loadInventory])
+
+  const startEdit = (item: InventoryRecord) => {
+    setEditingId(item.id)
+    setForm({
+      name: item.name,
+      category: item.category,
+      pack: item.pack,
+      price: String(item.price),
+      stock: String(item.stock),
+      reorderLevel: String(item.reorderLevel),
+      expiry: item.expiry?.slice(0, 10) ?? '',
+      sku: item.sku ?? '',
+      genericName: item.genericName ?? '',
+      manufacturer: item.manufacturer ?? '',
+      batchNumber: item.batchNumber ?? '',
+      gstRate: String(item.gstRate),
+      hsnCode: item.hsnCode ?? '',
+      prescriptionRequired: item.prescriptionRequired,
+      description: item.description ?? '',
+      imageUrl: item.imageUrl ?? '',
+    })
   }
 
-  const addItem = () => {
-    const name = window.prompt('Name of medicine to add')
-    if (!name?.trim()) return
-    setInventory((current) => [
-      ...current,
-      { id: Date.now(), name: name.trim(), category: 'New product · Pack size not set', price: 0, stock: 0, expiry: 'Add expiry', available: false },
-    ])
+  const saveMedicine = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (!form) return
+    setSaving(true)
+    setError('')
+    try {
+      const response = await ownerApiFetch(editingId ? `/api/medicines/${editingId}` : '/api/medicines', token, {
+        method: editingId ? 'PUT' : 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...form,
+          price: Number(form.price),
+          stock: Number(form.stock),
+          reorderLevel: Number(form.reorderLevel),
+          gstRate: Number(form.gstRate),
+          expiry: form.expiry || null,
+        }),
+      })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.error || 'Could not save medicine.')
+      const saved = result as InventoryRecord
+      setInventory((current) => editingId
+        ? current.map((item) => item.id === saved.id ? saved : item)
+        : [...current, saved].sort((a, b) => a.name.localeCompare(b.name)))
+      onCatalogChange()
+      setForm(null)
+      setEditingId(null)
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Could not save medicine.')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const changeStock = async (item: InventoryRecord, amount: number) => {
+    const stock = Math.max(0, item.stock + amount)
+    try {
+      const response = await ownerApiFetch(`/api/medicines/${item.id}`, token, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...item, stock }),
+      })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.error || 'Could not update stock.')
+      const updated = result as InventoryRecord
+      setInventory((current) => current.map((entry) => entry.id === updated.id ? updated : entry))
+      onCatalogChange()
+      setError('')
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Could not update stock.')
+    }
+  }
+
+  const removeMedicine = async (item: InventoryRecord) => {
+    if (!window.confirm(`Archive ${item.name}? It will be removed from active inventory.`)) return
+    try {
+      const response = await ownerApiFetch(`/api/medicines/${item.id}`, token, { method: 'DELETE' })
+      if (!response.ok) {
+        const result = await response.json()
+        throw new Error(result.error || 'Could not archive medicine.')
+      }
+      setInventory((current) => current.filter((entry) => entry.id !== item.id))
+      onCatalogChange()
+      setError('')
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Could not archive medicine.')
+    }
   }
 
   return (
     <section className="pharmacy-page-content">
       <div className="pharmacy-page-heading">
         <div><h3>Inventory</h3><p>Keep product availability and stock up to date.</p></div>
-        <button className="accept-action" onClick={addItem}><Plus className="icon" /> Add medicine</button>
+        <button
+          className="accept-action"
+          onClick={() => {
+            setEditingId(null)
+            setForm(emptyMedicineForm())
+          }}
+        >
+          <Plus className="icon" /> Add medicine
+        </button>
       </div>
+      {error && <p className="owner-form-error" role="alert">{error}</p>}
+      {form && (
+        <form className="owner-medicine-form" onSubmit={saveMedicine}>
+          <div className="panel-head">
+            <h3>{editingId ? 'Edit medicine details' : 'Add a medicine'}</h3>
+            <button type="button" className="quiet-action" onClick={() => setForm(null)}>Cancel</button>
+          </div>
+          <div className="owner-form-grid">
+            <label>Medicine name<input required value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} /></label>
+            <label>Category<input required list="medicine-category-options" value={form.category} onChange={(event) => setForm({ ...form, category: event.target.value })} /></label>
+            <datalist id="medicine-category-options">{categories.map((category) => <option key={category.name} value={category.name} />)}</datalist>
+            <label>Pack size<input required placeholder="e.g. 10 tablets" value={form.pack} onChange={(event) => setForm({ ...form, pack: event.target.value })} /></label>
+            <label>Sale price (₹)<input required type="number" min="0" step="0.01" value={form.price} onChange={(event) => setForm({ ...form, price: event.target.value })} /></label>
+            <label>Stock quantity<input required type="number" min="0" step="1" value={form.stock} onChange={(event) => setForm({ ...form, stock: event.target.value })} /></label>
+            <label>Low-stock alert at<input required type="number" min="0" step="1" value={form.reorderLevel} onChange={(event) => setForm({ ...form, reorderLevel: event.target.value })} /></label>
+            <label>Expiry date<input type="date" value={form.expiry} onChange={(event) => setForm({ ...form, expiry: event.target.value })} /></label>
+            <label>SKU / barcode<input value={form.sku} onChange={(event) => setForm({ ...form, sku: event.target.value })} /></label>
+            <label>Generic name<input value={form.genericName} onChange={(event) => setForm({ ...form, genericName: event.target.value })} /></label>
+            <label>Manufacturer<input value={form.manufacturer} onChange={(event) => setForm({ ...form, manufacturer: event.target.value })} /></label>
+            <label>Batch number<input value={form.batchNumber} onChange={(event) => setForm({ ...form, batchNumber: event.target.value })} /></label>
+            <label>GST rate (%)<input type="number" min="0" max="100" step="0.01" value={form.gstRate} onChange={(event) => setForm({ ...form, gstRate: event.target.value })} /></label>
+            <label>HSN code<input value={form.hsnCode} onChange={(event) => setForm({ ...form, hsnCode: event.target.value })} /></label>
+            <label>Image URL<input type="url" value={form.imageUrl} onChange={(event) => setForm({ ...form, imageUrl: event.target.value })} /></label>
+            <label className="owner-checkbox-field">
+              <input type="checkbox" checked={form.prescriptionRequired} onChange={(event) => setForm({ ...form, prescriptionRequired: event.target.checked })} />
+              Prescription required
+            </label>
+            <label className="owner-form-wide">Description<textarea rows={3} value={form.description} onChange={(event) => setForm({ ...form, description: event.target.value })} /></label>
+          </div>
+          <div className="owner-form-actions">
+            <button type="button" className="quiet-action" onClick={() => setForm(null)}>Cancel</button>
+            <button type="submit" className="accept-action" disabled={saving}>{saving ? 'Saving…' : 'Save medicine'}</button>
+          </div>
+        </form>
+      )}
       <div className="inventory-summary">
         <div><span>Products</span><strong>{inventory.length}</strong></div>
-        <div><span>Low stock</span><strong>{inventory.filter((item) => item.stock > 0 && item.stock < 10).length}</strong></div>
+        <div><span>Low stock</span><strong>{inventory.filter((item) => item.stock > 0 && item.stock <= item.reorderLevel).length}</strong></div>
         <div><span>Out of stock</span><strong>{inventory.filter((item) => item.stock === 0).length}</strong></div>
       </div>
       <div className="pharmacy-card-list">
@@ -1113,25 +1466,33 @@ function PharmacyMedicinesScreen() {
             <div className="inventory-product-icon"><Pill className="icon" /></div>
             <div className="inventory-main">
               <div className="data-card-heading">
-                <div><h3>{item.name}</h3><p>{item.category}</p></div>
-                <span className={item.stock === 0 ? 'danger-tag' : item.stock < 10 ? 'warning-tag' : 'status-pill'}>
-                  {item.stock === 0 ? 'Out of stock' : item.stock < 10 ? 'Low stock' : 'In stock'}
+                <div><h3>{item.name}</h3><p>{item.category} · {item.pack}{item.sku ? ` · ${item.sku}` : ''}</p></div>
+                <span className={item.stock === 0 ? 'danger-tag' : item.stock <= item.reorderLevel ? 'warning-tag' : 'status-pill'}>
+                  {item.stock === 0 ? 'Out of stock' : item.stock <= item.reorderLevel ? 'Low stock' : 'In stock'}
                 </span>
               </div>
               <div className="inventory-details">
-                <span>₹{item.price.toLocaleString('en-IN')}</span><span>{item.stock} units</span><span>Exp. {item.expiry}</span>
+                <span>₹{item.price.toLocaleString('en-IN')}</span>
+                <span>{item.stock} units · Alert at {item.reorderLevel}</span>
+                <span>Exp. {item.expiry ? new Date(`${item.expiry.slice(0, 10)}T00:00:00`).toLocaleDateString('en-IN', { month: 'short', year: 'numeric' }) : 'Not set'}</span>
               </div>
               <div className="inventory-controls">
                 <div className="mini-quantity">
-                  <button aria-label={`Decrease ${item.name} stock`} onClick={() => changeStock(item.id, -1)}><Minus className="icon" /></button>
+                  <button aria-label={`Decrease ${item.name} stock`} onClick={() => void changeStock(item, -1)}><Minus className="icon" /></button>
                   <span>{item.stock}</span>
-                  <button aria-label={`Increase ${item.name} stock`} onClick={() => changeStock(item.id, 1)}><Plus className="icon" /></button>
+                  <button aria-label={`Increase ${item.name} stock`} onClick={() => void changeStock(item, 1)}><Plus className="icon" /></button>
                 </div>
-                <span className="availability-label"><CircleCheck className="icon" /> {item.available ? 'Available' : 'Unavailable'}</span>
+                <span className="availability-label"><CircleCheck className="icon" /> {item.stock > 0 ? 'Available' : 'Unavailable'}</span>
+                <div className="owner-item-actions">
+                  <button type="button" className="quiet-action" aria-label={`Edit ${item.name}`} onClick={() => startEdit(item)}><Pencil className="icon" /> Edit</button>
+                  <button type="button" className="quiet-action danger-action" aria-label={`Archive ${item.name}`} onClick={() => void removeMedicine(item)}><Trash2 className="icon" /> Archive</button>
+                </div>
               </div>
             </div>
           </article>
         ))}
+        {loading && <div className="empty-state-card compact-empty">Loading inventory…</div>}
+        {!loading && inventory.length === 0 && <div className="empty-state-card compact-empty">No active medicines yet. Add your first product to start managing stock.</div>}
       </div>
     </section>
   )

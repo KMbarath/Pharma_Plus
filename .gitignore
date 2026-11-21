@@ -22,3 +22,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+.neon
+.devcerts/
+android/app/src/debug/res/raw/pharmaplus_dev_ca.pem
