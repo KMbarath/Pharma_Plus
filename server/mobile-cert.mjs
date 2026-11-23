@@ -1,5 +1,6 @@
+import { createPublicKey, X509Certificate } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
-import { copyFileSync, mkdirSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { networkInterfaces } from 'node:os'
 import { isIPv4 } from 'node:net'
 import { dirname, resolve } from 'node:path'
@@ -31,6 +32,33 @@ export function createMobileCertificate(ip) {
   const serverKey = resolve(certificateDirectory, 'server.key')
   const serverCsr = resolve(certificateDirectory, 'server.csr')
   const serverCert = resolve(certificateDirectory, 'server.crt')
+
+  if ([caKey, caCert, serverKey, serverCert, androidCertificate].every(existsSync)) {
+    const rootCertificate = new X509Certificate(readFileSync(caCert))
+    const serverCertificate = new X509Certificate(readFileSync(serverCert))
+    const rootPublicKey = rootCertificate.publicKey
+    const serverPublicKey = serverCertificate.publicKey
+    const publicKeyBytes = (key) => key.export({ format: 'der', type: 'spki' })
+    const rootKeyMatches = publicKeyBytes(createPublicKey(readFileSync(caKey))).equals(publicKeyBytes(rootPublicKey))
+    const serverKeyMatches = publicKeyBytes(createPublicKey(readFileSync(serverKey))).equals(publicKeyBytes(serverPublicKey))
+    const now = Date.now()
+    const certificateIsCurrent = (certificate) =>
+      Date.parse(certificate.validFrom) <= now && Date.parse(certificate.validTo) > now
+
+    if (
+      rootCertificate.ca
+      && rootCertificate.verify(rootPublicKey)
+      && certificateIsCurrent(rootCertificate)
+      && serverCertificate.checkIP(ip)
+      && serverCertificate.verify(rootPublicKey)
+      && certificateIsCurrent(serverCertificate)
+      && rootKeyMatches
+      && serverKeyMatches
+      && readFileSync(androidCertificate).equals(readFileSync(caCert))
+    ) {
+      return { ip, serverKey, serverCert, androidCertificate }
+    }
+  }
 
   execFileSync('openssl', [
     'req', '-x509', '-newkey', 'rsa:3072', '-nodes', '-sha256', '-days', '825',

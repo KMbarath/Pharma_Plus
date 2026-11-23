@@ -11,7 +11,7 @@ pgAdmin 4 is the database management client; PostgreSQL Server must also be inst
 
 ## Set up the database
 
-Create a database named `pharma_plus` in pgAdmin, then run `database/schema.sql` in its Query Tool. This creates the pharmacy, medicine, supplier, inventory, customer, staff, sales, payment, discount, and settings tables, along with starter categories.
+Create a database named `pharma_plus` in pgAdmin, then run `database/schema.sql` in its Query Tool. This creates the pharmacy, medicine, supplier, inventory, customer, staff, sales, payment, discount, settings, and account tables, along with starter categories. It also creates order-status history and verified-purchase product-review tables. Customer accounts are platform-wide. Each pharmacy-owner account creates its own pharmacy, and its products and inventory are isolated from other pharmacies.
 
 Alternatively, with the local server running and the current macOS user allowed to connect:
 
@@ -32,11 +32,18 @@ npm run db:setup
 npm run dev
 ```
 
-The development command starts the API and Vite frontend. Open the Vite URL printed in the terminal, then open **Pharmacy dashboard**. On first use, create the owner account on this Mac with a unique password of at least 12 characters. Use **Medicines** to add and manage medicines; changes persist in PostgreSQL.
+The development command starts the API and Vite frontend. Open the Vite URL printed in the terminal. The redesigned welcome screen leads into separate account-type selection and sign-in/sign-up screens:
+
+- Choose **Sign in** or **Create new account**. New users select **Customer** or **Pharmacy owner** before continuing. Pharmacy owners register with their name, pharmacy name, email, and a password of at least 12 characters; each owner can manage only that pharmacy's inventory.
+- Customers can browse category-filtered medicines, search pharmacies, review a separate cart and checkout, track delivery status, and save profile details using either the device's current GPS coordinates or a manually entered delivery address. Customer accounts work across pharmacies.
+
+Both account types use the same local PostgreSQL database. Owner inventory changes persist in PostgreSQL and can be inspected in pgAdmin under `public.medicines`. Customer profile details are saved under `public.user_accounts` and `public.customer_addresses`; GPS coordinates are stored as latitude and longitude without reverse-geocoding or sending them to a lookup service.
+
+Customers can filter medicines by category, search pharmacies, place orders, follow status timestamps, and share a one-time delivery code with the pharmacy at handoff. The API stores only a hash of the code. A customer can review a medicine after a delivered order; reviews and ratings are saved in `public.product_reviews`. Owner workspaces show inventory alerts, expiry attention, stock movements, and order fulfillment. Re-run `npm run db:setup` after updating the project to apply the idempotent schema changes.
 
 ## Build and use a local-network Android APK
 
-Keep the Mac and phone on the same trusted Wi-Fi. Create the owner account in the Mac browser first, then build the debug APK:
+Keep the Mac and phone on the same trusted Wi-Fi. Build the debug APK:
 
 ```sh
 npm run mobile:build
@@ -50,7 +57,7 @@ Start the HTTPS API on the Mac before opening the APK:
 npm run api:mobile
 ```
 
-Install `release/Pharma-Plus-mobile-debug.apk` on the phone, keep both devices on that Wi-Fi, and sign in with the owner account. After adding or editing a medicine, refresh `pharma_plus` in pgAdmin and inspect the `public.medicines` table. The Mac firewall must allow incoming connections to port `3002`.
+Install `release/Pharma-Plus-mobile-debug.apk` on the phone, keep both devices on that Wi-Fi, then create an account or sign in and choose **Customer** or **Pharmacy owner**. Customers can choose a device GPS location or enter a delivery address manually from their profile. Pharmacy owners can add or edit medicines from the single-screen inventory editor; changes are saved in `public.medicines` and scoped to their pharmacy. Customer orders and order-status timestamps are stored in `public.sales_orders` and `public.order_status_events`; the owner's delivery screen verifies the customer's code before marking an order delivered. The Mac firewall must allow incoming connections to port `3002`.
 
 This is a local development setup, not a production deployment. The APK is tied to the Mac's current LAN IP and debug certificate; rebuild it if that IP changes. Do not use real patient data or expose this development API to the public internet.
 
