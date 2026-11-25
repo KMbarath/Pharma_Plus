@@ -4,16 +4,16 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "node server/dev.mjs",
-    "api": "node server/index.mjs",
-    "api:mobile": "MOBILE_LAN=1 node server/index.mjs",
-    "db:setup": "node server/migrate.mjs",
-    "mobile:cert": "node server/mobile-cert.mjs",
-    "mobile:build": "node server/mobile-build.mjs",
+    "dev": "node --env-file-if-exists=.env server/dev.mjs",
+    "api": "node --env-file-if-exists=.env server/index.mjs",
+    "api:mobile": "node --env-file-if-exists=.env server/mobile-api.mjs",
+    "db:setup": "node --env-file-if-exists=.env server/migrate.mjs",
+    "mobile:cert": "node --env-file-if-exists=.env server/mobile-cert.mjs",
+    "mobile:build": "node --env-file-if-exists=.env server/mobile-build.mjs",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "preview": "vite preview",
-    "start": "node server/index.mjs"
+    "start": "node --env-file-if-exists=.env server/index.mjs"
   },
   "dependencies": {
     "@capacitor/android": "^8.6.2",
@@ -25,6 +25,7 @@
     "express": "^5.1.0",
     "framer-motion": "^14.14.0",
     "lucide-react": "^1.73.0",
+    "multer": "^2.5.0",
     "pg": "^8.16.3",
     "postcss": "^8.5.33",
     "react": "^19.3.1",

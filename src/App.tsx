@@ -40,19 +40,36 @@ type Product = {
   pharmacyId: number
   pharmacyName: string
   name: string
+  brandName: string | null
+  genericName: string | null
+  strength: string | null
+  dosageForm: string | null
+  packQuantity: number | null
+  packUnit: string | null
+  deliveryFee?: number | null
+  pickupAvailable?: boolean
   category: string
   pack: string
   price: number
   stock: number
   originalPrice?: number
   image: string
+  imageUrl?: string | null
   rating?: number
   reviewCount?: number
   description: string
+  manufacturer?: string | null
+  batchNumber?: string | null
+  expiryDate?: string | null
+  prescriptionRequired?: boolean
+  available?: boolean
+  availabilityReason?: string | null
+  warnings?: string[]
   badge?: string
 }
 
 type CartItem = Product & {
+  pharmacy_id: number
   quantity: number
 }
 
@@ -61,6 +78,13 @@ type InventoryRecord = {
   pharmacyId: number
   pharmacyName: string
   name: string
+  brandName: string | null
+  strength: string | null
+  dosageForm: string | null
+  packQuantity: number | null
+  packUnit: string | null
+  deliveryFee?: number | null
+  pickupAvailable?: boolean
   category: string
   pack: string
   price: number
@@ -83,8 +107,13 @@ type InventoryRecord = {
 
 type MedicineForm = {
   name: string
+  brandName: string
   category: string
   pack: string
+  strength: string
+  dosageForm: string
+  packQuantity: string
+  packUnit: string
   price: string
   stock: string
   reorderLevel: string
@@ -100,7 +129,7 @@ type MedicineForm = {
   imageUrl: string
 }
 
-type AccountRole = 'customer' | 'pharmacy_owner'
+type AccountRole = 'customer' | 'pharmacy_owner' | 'admin'
 
 type AccountUser = {
   id: number
@@ -126,12 +155,36 @@ type AccountSession = {
 type CustomerAddress = {
   id: number
   label: string
-  address: string
+  contactPhone: string | null
+  address: string | null
   city: string | null
   state: string | null
   postalCode: string | null
   latitude: number | null
   longitude: number | null
+  isDefault: boolean
+}
+
+type PrescriptionItem = {
+  medicineId: number
+  name: string
+  requestedQuantity: number
+  approvedQuantity: number | null
+  remainingQuantity: number
+  medicineMatches?: boolean | null
+}
+
+type PrescriptionRecord = {
+  id: number
+  status: 'pending' | 'approved' | 'rejected' | 'correction_required'
+  submittedAt: string
+  prescriptionDate: string | null
+  validUntil: string | null
+  reviewReason: string | null
+  retentionUntil: string
+  documentAvailable: boolean
+  customerName?: string
+  items: PrescriptionItem[]
 }
 
 type PharmacyChoice = {
@@ -139,6 +192,77 @@ type PharmacyChoice = {
   name: string
   city: string | null
   state: string | null
+}
+
+type ProductComparisonListing = {
+  medicineId: number
+  pharmacyId: number
+  pharmacyName: string
+  address: string | null
+  city: string | null
+  state: string | null
+  phone: string | null
+  name: string
+  brandName: string
+  genericName: string
+  strength: string
+  dosageForm: string
+  packQuantity: number
+  packUnit: string
+  pack: string
+  price: number
+  prescriptionRequired: boolean
+  available: boolean
+  availableStock: number
+  pickupAvailable: boolean
+  deliveryFee: number | null
+  estimatedDeliveryTotal: number | null
+  distanceKm: number | null
+  description: string | null
+  imageUrl: string | null
+  category: string
+}
+
+type NonIdenticalListing = {
+  medicineId: number
+  pharmacyId: number
+  pharmacyName: string
+  name: string
+  brandName: string | null
+  genericName: string | null
+  strength: string | null
+  dosageForm: string | null
+  packQuantity: number | null
+  packUnit: string | null
+  pack: string
+  price: number
+  available: boolean
+  availableStock: number
+  nonIdentical: true
+}
+
+type ProductComparison = {
+  product: {
+    id: number
+    pharmacyId: number
+    pharmacyName: string
+    name: string
+    brandName: string | null
+    genericName: string | null
+    strength: string | null
+    dosageForm: string | null
+    packQuantity: number | null
+    packUnit: string | null
+    pack: string
+    category: string
+    price: number
+    availableStock: number
+    description: string | null
+    imageUrl: string | null
+    identityComplete: boolean
+  }
+  listings: ProductComparisonListing[]
+  nonIdenticalListings: NonIdenticalListing[]
 }
 
 type OrderEvent = {
@@ -155,12 +279,74 @@ type CustomerOrder = {
   customerName?: string
   customerPhone?: string | null
   total: number
-  deliveryAddress: string
+  subtotal: number
+  discountAmount: number
+  discountCode: string | null
+  taxAmount: number
+  deliveryFee: number
+  paymentMethod: string
+  paymentStatus: 'pending' | 'paid' | 'refunded' | 'failed'
+  deliveryAddress: string | null
+  fulfillmentMethod: 'delivery' | 'pickup'
+  deliveryLatitude: number | null
+  deliveryLongitude: number | null
   createdAt: string
   updatedAt: string
-  items: Array<{ medicineId: number; name: string; quantity: number; unitPrice: number; lineTotal: number }>
+  items: Array<{
+    medicineId: number
+    name: string
+    quantity: number
+    prescriptionId: number | null
+    prescriptionRequired: boolean
+    packQuantity: number | null
+    baseUnitQuantity: number | null
+    baseUnitName: string | null
+    unitPrice: number
+    discountAmount: number
+    taxAmount: number
+    lineTotal: number
+  }>
   events: OrderEvent[]
   deliveryOtp?: string
+}
+
+type CheckoutQuoteLine = {
+  medicineId: number
+  pharmacyId: number
+  prescriptionId: number | null
+  prescriptionRequired: boolean
+  prescriptionValidUntil: string | null
+  name: string
+  quantity: number
+  availableQuantity: number
+  packQuantity: number | null
+  packUnit: string | null
+  baseUnitQuantity: number | null
+  unitPrice: number
+  lineSubtotal: number
+  taxRate: number
+  discountAmount: number
+  taxAmount: number
+  lineTotal: number
+}
+
+type CheckoutQuote = {
+  quoteId: string
+  expiresAt: string
+  pharmacyId: number
+  pharmacyName: string
+  items: CheckoutQuoteLine[]
+  fulfillmentMethod: 'delivery' | 'pickup'
+  addressId: number | null
+  deliveryAddress: string | null
+  paymentMethod: string
+  discount: { code: string; description: string | null; type: string; value: number } | null
+  discountCode: string | null
+  subtotal: number
+  discountAmount: number
+  taxAmount: number
+  deliveryFee: number
+  total: number
 }
 
 const SESSION_STORAGE_KEY = 'pharma-plus-session-token'
@@ -183,24 +369,57 @@ const apiUrl = (path: string) => `${API_BASE_URL}${path}`
 type ProfileForm = {
   fullName: string
   phone: string
+}
+
+type AddressForm = {
+  label: string
+  contactPhone: string
   address: string
   city: string
   state: string
   postalCode: string
   latitude: number | null
   longitude: number | null
+  isDefault: boolean
 }
 
 const emptyProfileForm = (): ProfileForm => ({
   fullName: '',
   phone: '',
+})
+
+const emptyAddressForm = (): AddressForm => ({
+  label: 'Home',
+  contactPhone: '',
   address: '',
   city: '',
   state: '',
   postalCode: '',
   latitude: null,
   longitude: null,
+  isDefault: false,
 })
+
+const formatCustomerAddress = (address?: CustomerAddress | null) => {
+  if (!address) return ''
+  const text = [address.address, address.city, address.state, address.postalCode].filter(Boolean).join(', ')
+  const coordinates = address.latitude !== null && address.longitude !== null
+    ? `GPS coordinates: ${address.latitude.toFixed(5)}, ${address.longitude.toFixed(5)}`
+    : ''
+  return [text, coordinates].filter(Boolean).join(' · ')
+}
+
+const formatOrderLocation = (order: CustomerOrder) => {
+  const coordinates = order.deliveryLatitude !== null && order.deliveryLatitude !== undefined &&
+      order.deliveryLongitude !== null && order.deliveryLongitude !== undefined
+    ? `GPS coordinates: ${order.deliveryLatitude.toFixed(5)}, ${order.deliveryLongitude.toFixed(5)}`
+    : ''
+  return [order.deliveryAddress, coordinates].filter(Boolean).join(' · ') ||
+    (order.fulfillmentMethod === 'pickup' ? 'Pickup at pharmacy' : 'No delivery location details')
+}
+
+const formatOrderItemQuantity = (item: CustomerOrder['items'][number]) =>
+  `${item.quantity} pack(s)${item.baseUnitQuantity !== null ? ` / ${item.baseUnitQuantity} ${item.baseUnitName}` : ''}`
 
 const sessionStorageToken = () => localStorage.getItem(SESSION_STORAGE_KEY)
 
@@ -220,8 +439,13 @@ function ownerApiFetch(path: string, token: string, init: RequestInit = {}) {
 
 const emptyMedicineForm = (): MedicineForm => ({
   name: '',
+  brandName: '',
   category: '',
   pack: '',
+  strength: '',
+  dosageForm: '',
+  packQuantity: '',
+  packUnit: '',
   price: '',
   stock: '0',
   reorderLevel: '10',
@@ -252,8 +476,10 @@ const categories = [
 const sidebarItems: Array<{ label: string; icon: LucideIcon }> = [
   { label: 'Home', icon: LayoutGrid },
   { label: 'Orders', icon: ClipboardList },
+  { label: 'Prescriptions', icon: ClipboardList },
   { label: 'Medicines', icon: Pill },
   { label: 'Delivery', icon: Truck },
+  { label: 'Verification', icon: BadgeAlert },
 ]
 
 const customerTabs = ['Home', 'Search', 'Favorites', 'Cart', 'Profile']
@@ -268,7 +494,6 @@ function App() {
   const [catalogError, setCatalogError] = useState('')
   const [selectedCategory, setSelectedCategory] = useState('All medicines')
   const [paymentMethod, setPaymentMethod] = useState('Cash on Delivery')
-  const [favoriteIds, setFavoriteIds] = useState<number[]>([])
 
   const refreshCatalog = async () => {
     try {
@@ -290,6 +515,14 @@ function App() {
         pharmacyId: item.pharmacyId,
         pharmacyName: item.pharmacyName,
         name: item.name,
+        brandName: item.brandName,
+        genericName: item.genericName,
+        strength: item.strength,
+        dosageForm: item.dosageForm,
+        packQuantity: item.packQuantity,
+        packUnit: item.packUnit,
+        deliveryFee: item.deliveryFee,
+        pickupAvailable: item.pickupAvailable,
         category: item.category,
         pack: item.pack,
         price: item.price,
@@ -298,6 +531,7 @@ function App() {
         description: item.description || '',
         rating: item.rating,
         reviewCount: item.reviewCount,
+        prescriptionRequired: item.prescriptionRequired,
       })))
       setStoreCategories((categoriesResult as Array<{ name: string }>).map(({ name }) => ({
         name,
@@ -322,29 +556,34 @@ function App() {
   )
 
   const handleAddToCart = (product: Product, quantity: number) => {
-    if (cart[0] && cart[0].pharmacyId !== product.pharmacyId) {
+    if (!Number.isSafeInteger(quantity) || quantity < 1 || !Number.isSafeInteger(product.pharmacyId) || product.pharmacyId < 1) {
+      setCartError('Choose a valid medicine quantity and pharmacy.')
+      return false
+    }
+    if (product.stock < 1 || quantity > product.stock) {
+      setCartError(`Only ${Math.max(0, product.stock)} pack(s) are currently available for ${product.name}. Refresh stock before adding more.`)
+      return false
+    }
+    if (cart.some((item) => item.pharmacy_id !== product.pharmacyId)) {
       setCartError('Your cart contains medicines from another pharmacy. Place that order first or clear your cart.')
+      return false
+    }
+    const existing = cart.find((item) => item.id === product.id)
+    if (existing && existing.quantity + quantity > product.stock) {
+      setCartError(`Only ${Math.max(0, product.stock - existing.quantity)} additional pack(s) of ${product.name} are currently available.`)
       return false
     }
     setCartError('')
     setCart((current) => {
-      const existing = current.find((item) => item.id === product.id)
-      if (existing) {
+      const currentItem = current.find((item) => item.id === product.id)
+      if (currentItem) {
         return current.map((item) =>
           item.id === product.id ? { ...item, quantity: Math.min(item.stock, item.quantity + quantity) } : item,
         )
       }
-      return [...current, { ...product, quantity: Math.min(product.stock, quantity) }]
+      return [...current, { ...product, pharmacy_id: product.pharmacyId, quantity: Math.min(product.stock, quantity) }]
     })
     return true
-  }
-
-  const toggleFavorite = (productId: number) => {
-    setFavoriteIds((current) =>
-      current.includes(productId)
-        ? current.filter((id) => id !== productId)
-        : [...current, productId],
-    )
   }
 
   const updateCartQuantity = (id: number, adjustment: number) => {
@@ -357,7 +596,8 @@ function App() {
     )
   }
 
-  const total = subtotal + (subtotal > 0 ? 49 : 0) + (subtotal > 0 ? Math.round(subtotal * 0.05 * 100) / 100 : 0)
+  const total = subtotal + (cart[0]?.deliveryFee ?? 0) +
+    (subtotal > 0 ? Math.round(subtotal * 0.05 * 100) / 100 : 0)
 
   return (
     <BrowserRouter>
@@ -365,14 +605,12 @@ function App() {
         cart={cart}
         catalogError={catalogError}
         categories={storeCategories}
-        favoriteIds={favoriteIds}
         onAddToCart={handleAddToCart}
         onClearCart={() => setCart([])}
         cartError={cartError}
         onCatalogChange={() => void refreshCatalog()}
         onSelectPharmacy={setSelectedPharmacyId}
         onSelectCategory={setSelectedCategory}
-        onToggleFavorite={toggleFavorite}
         onUpdateCartQuantity={updateCartQuantity}
         paymentMethod={paymentMethod}
         pharmacies={pharmacies}
@@ -392,13 +630,11 @@ type ApplicationRoutesProps = {
   cartError: string
   catalogError: string
   categories: Array<{ name: string; icon: string }>
-  favoriteIds: number[]
   onAddToCart: (product: Product, quantity: number) => boolean
   onClearCart: () => void
   onCatalogChange: () => void
   onSelectPharmacy: (value: string) => void
   onSelectCategory: (value: string) => void
-  onToggleFavorite: (productId: number) => void
   onUpdateCartQuantity: (id: number, adjustment: number) => void
   paymentMethod: string
   pharmacies: PharmacyChoice[]
@@ -415,13 +651,11 @@ function ApplicationRoutes({
   cartError,
   catalogError,
   categories: storeCategories,
-  favoriteIds,
   onAddToCart,
   onClearCart,
   onCatalogChange,
   onSelectPharmacy,
   onSelectCategory,
-  onToggleFavorite,
   onUpdateCartQuantity,
   paymentMethod,
   pharmacies,
@@ -436,6 +670,61 @@ function ApplicationRoutes({
   const [accountSession, setAccountSession] = useState<AccountSession | null>(null)
   const [authReady, setAuthReady] = useState(false)
   const [authError, setAuthError] = useState('')
+  const [favoriteIds, setFavoriteIds] = useState<number[]>([])
+  const [favoritesError, setFavoritesError] = useState('')
+
+  useEffect(() => {
+    let cancelled = false
+    const loadFavorites = async () => {
+      if (!accountSession || accountSession.user.role !== 'customer') {
+        setFavoriteIds([])
+        return
+      }
+      try {
+        const response = await authenticatedApiFetch('/api/me/favorites', accountSession.token)
+        const result = await response.json() as { medicineIds?: number[]; error?: string }
+        if (!response.ok) throw new Error(result.error || 'Could not load your favorites.')
+        if (!cancelled) {
+          setFavoriteIds(result.medicineIds ?? [])
+          setFavoritesError('')
+        }
+      } catch (requestError) {
+        if (!cancelled) setFavoritesError(requestError instanceof Error ? requestError.message : 'Could not load your favorites.')
+      }
+    }
+    // Load server-persisted favorites when the customer session is restored or changed.
+    // oxlint-disable-next-line react/set-state-in-effect
+    void loadFavorites()
+    return () => { cancelled = true }
+  }, [accountSession])
+
+  const toggleFavorite = async (medicineId: number): Promise<boolean> => {
+    if (!accountSession || accountSession.user.role !== 'customer') {
+      setFavoritesError('Sign in with a customer account to save favorites.')
+      return false
+    }
+    setFavoritesError('')
+    const removing = favoriteIds.includes(medicineId)
+    try {
+      const response = await authenticatedApiFetch(
+        removing ? `/api/me/favorites/${medicineId}` : '/api/me/favorites',
+        accountSession.token,
+        removing
+          ? { method: 'DELETE' }
+          : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ medicineId }) },
+      )
+      const result = await response.json() as { error?: string }
+      if (!response.ok) throw new Error(result.error || 'Could not update your favorites.')
+      setFavoriteIds((current) => removing
+        ? current.filter((id) => id !== medicineId)
+        : current.includes(medicineId) ? current : [...current, medicineId])
+      return true
+    } catch (requestError) {
+      setFavoritesError(requestError instanceof Error ? requestError.message : 'Could not update your favorites.')
+      return false
+    }
+  }
+  const onToggleFavorite = toggleFavorite
 
   useEffect(() => {
     let cancelled = false
@@ -514,6 +803,10 @@ function ApplicationRoutes({
     )
   }
 
+  if (accountSession.user.role === 'admin') {
+    return <AdminPage session={accountSession} onSignOut={() => void signOut()} />
+  }
+
   if (accountSession.user.role === 'pharmacy_owner') {
     return (
       <div className="app-shell owner-app-shell">
@@ -549,6 +842,7 @@ function ApplicationRoutes({
                 onSelectCategory={onSelectCategory}
                 favoriteIds={favoriteIds}
                 onToggleFavorite={onToggleFavorite}
+                favoritesError={favoritesError}
                 catalogError={catalogError}
               />
             }
@@ -561,7 +855,7 @@ function ApplicationRoutes({
                 description="Your saved wellness essentials, all in one place."
                 products={products.filter((product) => favoriteIds.includes(product.id))}
                 onToggleFavorite={onToggleFavorite}
-                onAddToCart={onAddToCart}
+                favoritesError={favoritesError}
                 emptyMessage="Products you save will appear here."
               />
             }
@@ -578,6 +872,16 @@ function ApplicationRoutes({
               />
             }
           />
+          <Route
+            path="/compare/:id"
+            element={
+              <CustomerProductComparePage
+                products={products}
+                session={accountSession}
+                onAddToCart={onAddToCart}
+              />
+            }
+          />
           <Route path="/orders/:orderId" element={<CustomerOrderTrackingPage session={accountSession} />} />
           <Route path="/orders" element={<CustomerOrdersPage session={accountSession} />} />
           <Route path="/profile" element={<CustomerProfilePage session={accountSession} onSignOut={() => void signOut()} />} />
@@ -588,7 +892,7 @@ function ApplicationRoutes({
               onAddToCart={onAddToCart}
               onToggleFavorite={onToggleFavorite}
               favoriteIds={favoriteIds}
-              cartError={cartError}
+              favoritesError={favoritesError}
               onReviewsChanged={onCatalogChange}
               reviewsOnly
             />
@@ -600,7 +904,7 @@ function ApplicationRoutes({
               onAddToCart={onAddToCart}
               onToggleFavorite={onToggleFavorite}
               favoriteIds={favoriteIds}
-              cartError={cartError}
+              favoritesError={favoritesError}
               onReviewsChanged={onCatalogChange}
             />
           } />
@@ -611,11 +915,9 @@ function ApplicationRoutes({
                 cart={cart}
                 cartError={cartError}
                 session={accountSession}
-                subtotal={subtotal}
                 paymentMethod={paymentMethod}
                 setPaymentMethod={setPaymentMethod}
                 onClearCart={onClearCart}
-                total={total}
               />
             }
           />
@@ -637,6 +939,7 @@ function CustomerHomePage({
   onSelectCategory,
   favoriteIds,
   onToggleFavorite,
+  favoritesError,
   catalogError,
 }: {
   session: AccountSession
@@ -648,7 +951,8 @@ function CustomerHomePage({
   selectedCategory: string
   onSelectCategory: (value: string) => void
   favoriteIds: number[]
-  onToggleFavorite: (productId: number) => void
+  onToggleFavorite: (productId: number) => Promise<boolean>
+  favoritesError: string
   catalogError: string
 }) {
   const navigate = useNavigate()
@@ -665,7 +969,7 @@ function CustomerHomePage({
   const filteredProducts = products.filter((product) => {
     const matchesPharmacy = !selectedPharmacyId || product.pharmacyId === Number(selectedPharmacyId)
     const matchesCategory = selectedCategory === 'All medicines' || product.category === selectedCategory
-    const matchesQuery = !query.trim() || `${product.name} ${product.category} ${product.pharmacyName}`.toLowerCase().includes(query.trim().toLowerCase())
+    const matchesQuery = !query.trim() || `${product.name} ${product.brandName ?? ''} ${product.genericName ?? ''} ${product.strength ?? ''} ${product.dosageForm ?? ''} ${product.category} ${product.pharmacyName}`.toLowerCase().includes(query.trim().toLowerCase())
     return matchesPharmacy && matchesCategory && matchesQuery
   })
   const pharmacyOptions = pharmacies.filter((pharmacy) =>
@@ -787,6 +1091,7 @@ function CustomerHomePage({
           </div>
         </div>
         {catalogError && <p className="owner-form-error" role="alert">{catalogError}</p>}
+        {favoritesError && <p className="owner-form-error" role="alert">{favoritesError}</p>}
       </section>
 
       <section className="home-promo-banner">
@@ -796,7 +1101,7 @@ function CustomerHomePage({
 
       <section className="section-block">
         <div className="section-header">
-          <div><h3>Recommended for you</h3><small>Trusted picks from local pharmacies</small></div>
+          <div><h3>Explore pharmacy listings</h3><small>Products currently listed by verified pharmacies</small></div>
           <button type="button" onClick={() => onSelectCategory('All medicines')}>See all</button>
         </div>
         <div className="product-row horizontal-scroll">
@@ -880,21 +1185,20 @@ function CustomerCollectionPage({
   description,
   products,
   onToggleFavorite,
-  onAddToCart,
+  favoritesError,
   emptyMessage,
 }: {
   title: string
   description: string
   products: Product[]
-  onToggleFavorite: (productId: number) => void
-  onAddToCart: (product: Product, quantity: number) => boolean
+  onToggleFavorite: (productId: number) => Promise<boolean>
+  favoritesError: string
   emptyMessage: string
 }) {
   const navigate = useNavigate()
   const [query, setQuery] = useState('')
-  const [error, setError] = useState('')
   const visibleProducts = products.filter((product) =>
-    `${product.name} ${product.category} ${product.pharmacyName}`.toLowerCase().includes(query.trim().toLowerCase()),
+    `${product.name} ${product.brandName ?? ''} ${product.genericName ?? ''} ${product.strength ?? ''} ${product.dosageForm ?? ''} ${product.category} ${product.pharmacyName}`.toLowerCase().includes(query.trim().toLowerCase()),
   )
 
   return (
@@ -906,7 +1210,7 @@ function CustomerCollectionPage({
         <p>{description}</p>
       </header>
       <label className="search-field collection-search"><Search className="search-icon" /><input type="search" placeholder="Search within favorites…" value={query} onChange={(event) => setQuery(event.target.value)} /></label>
-      {error && <p className="owner-form-error" role="alert">{error}</p>}
+      {favoritesError && <p className="owner-form-error" role="alert">{favoritesError}</p>}
       {visibleProducts.length > 0 ? (
         <div className="customer-product-grid">
           {visibleProducts.map((product) => (
@@ -929,10 +1233,9 @@ function CustomerCollectionPage({
                 <strong>₹{product.price.toLocaleString('en-IN')}</strong>
                 <button type="button" className="mini-cart-button" onClick={(event) => {
                   event.stopPropagation()
-                  if (onAddToCart(product, 1)) navigate('/cart')
-                  else setError('Medicines from different pharmacies must be ordered separately.')
-                }} aria-label={`Add ${product.name} to cart`}>
-                  <ShoppingBag className="icon" /> Add to cart
+                  navigate(`/compare/${product.id}`)
+                }} aria-label={`Compare pharmacies for ${product.name}`}>
+                  <ShoppingBag className="icon" /> Compare & choose pharmacy
                 </button>
               </div>
             </article>
@@ -992,8 +1295,8 @@ function CustomerCartPage({
                   <img src={item.image} alt={item.name} />
                   <div className="cart-copy">
                     <h4>{item.name}</h4>
-                    <small>{item.pack}</small>
-                    <strong>₹{item.price.toLocaleString('en-IN')}</strong>
+                    <small>{item.pack} · {item.quantity} pack(s){item.packQuantity && item.packUnit ? ` / ${item.quantity * item.packQuantity} ${item.packUnit}` : ''}</small>
+                    <strong>₹{item.price.toLocaleString('en-IN')} / pack</strong>
                   </div>
                   <div className="mini-quantity">
                     <button type="button" onClick={() => updateCartQuantity(item.id, -1)} aria-label={`Decrease ${item.name} quantity`}><Minus className="icon" /></button>
@@ -1007,11 +1310,12 @@ function CustomerCartPage({
           </section>
           <section className="cart-context-card">
             <div><MapPin className="icon" /><span><strong>Delivery details</strong><small>Choose or update your address at checkout.</small></span><button type="button" onClick={() => navigate('/profile')}>Edit</button></div>
-            <div><Truck className="icon" /><span><strong>Home delivery</strong><small>Estimated delivery time is confirmed by the pharmacy.</small></span></div>
+            <div><Truck className="icon" /><span><strong>Delivery or pickup</strong><small>Availability and fees are confirmed at checkout.</small></span></div>
           </section>
           <section className="cart-total-card">
             <div><span>Subtotal</span><strong>₹{subtotal.toLocaleString('en-IN')}</strong></div>
-            <div><span>Delivery & taxes</span><strong>Calculated at checkout</strong></div>
+            <div><span>Disclosed delivery fee</span><strong>{cart[0]?.deliveryFee === null || cart[0]?.deliveryFee === undefined ? 'Not provided' : `₹${cart[0].deliveryFee.toLocaleString('en-IN')}`}</strong></div>
+            <div><span>Tax estimate</span><strong>₹{(subtotal > 0 ? Math.round(subtotal * 0.05 * 100) / 100 : 0).toLocaleString('en-IN')}</strong></div>
             <div className="cart-total-row"><span>Estimated total</span><strong>₹{total.toLocaleString('en-IN')}</strong></div>
           </section>
           <button type="button" className="accept-action checkout-next-button" onClick={() => navigate('/checkout')}>
@@ -1144,8 +1448,9 @@ function CustomerOrdersPage({ session }: { session: AccountSession }) {
                   <span className={`order-status-pill ${order.status}`}>{orderStatusLabel[order.status] ?? order.status}</span>
                 </header>
                 <p className="customer-order-pharmacy">{order.pharmacyName} · {new Date(order.createdAt).toLocaleString()}</p>
+                {order.paymentMethod === 'UPI Payment' && order.paymentStatus === 'pending' && <p className="checkout-quote-prompt">UPI payment is pending; it is not considered paid until verified by a payment gateway.</p>}
                 <div className="customer-order-items">
-                  {order.items.map((item) => <div key={`${order.id}-${item.medicineId}`}><span>{item.name} × {item.quantity}</span><strong>₹{item.lineTotal.toLocaleString('en-IN')}</strong></div>)}
+                  {order.items.map((item) => <div key={`${order.id}-${item.medicineId}`}><span>{item.name} × {formatOrderItemQuantity(item)}</span><strong>₹{item.lineTotal.toLocaleString('en-IN')}</strong></div>)}
                 </div>
                 <div className="customer-order-total"><span>Total</span><strong>₹{order.total.toLocaleString('en-IN')}</strong></div>
                 <OrderTimeline order={order} />
@@ -1153,7 +1458,7 @@ function CustomerOrdersPage({ session }: { session: AccountSession }) {
                 {order.status === 'out_for_delivery' && otp && (
                   <div className="delivery-otp-card"><span>Share this delivery code with your pharmacy</span><strong>{otp}</strong><small>Only share when your order arrives.</small></div>
                 )}
-                <p className="customer-order-address"><MapPin className="icon" /> {order.deliveryAddress}</p>
+                <p className="customer-order-address"><MapPin className="icon" /> {order.fulfillmentMethod === 'pickup' ? 'Pharmacy pickup' : formatOrderLocation(order)}</p>
               </article>
             )
           })}
@@ -1166,6 +1471,234 @@ function CustomerOrdersPage({ session }: { session: AccountSession }) {
           {!orders.length && <NavLink to="/" className="accept-action">Browse medicines</NavLink>}
         </div>
       )}
+      <CustomerBottomNav />
+    </motion.main>
+  )
+}
+
+function CustomerProductComparePage({
+  products,
+  session,
+  onAddToCart,
+}: {
+  products: Product[]
+  session: AccountSession
+  onAddToCart: (product: Product, quantity: number) => boolean
+}) {
+  const { id } = useParams()
+  const navigate = useNavigate()
+  const location = useLocation()
+  const product = products.find((item) => item.id === Number(id))
+  const [comparison, setComparison] = useState<ProductComparison | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const [locationNotice, setLocationNotice] = useState('')
+  const [quantity, setQuantity] = useState(() => {
+    const state = location.state as { quantity?: unknown } | null
+    return typeof state?.quantity === 'number' && Number.isSafeInteger(state.quantity) && state.quantity > 0
+      ? state.quantity
+      : 1
+  })
+  const [cartError, setCartError] = useState('')
+  const [pharmacyDetailId, setPharmacyDetailId] = useState<number | null>(null)
+  const [pharmacyDetails, setPharmacyDetails] = useState<Record<number, { phone: string | null; address: string | null; distanceKm: number | null }>>({})
+  const [detailError, setDetailError] = useState('')
+  const [origin, setOrigin] = useState<{ latitude: number; longitude: number } | null>(null)
+
+  useEffect(() => {
+    if (!product) return
+    let cancelled = false
+    const loadComparison = async () => {
+      setLoading(true)
+      setError('')
+      setLocationNotice('')
+      let coordinates: { latitude: number; longitude: number } | null = null
+      try {
+        const profileResponse = await authenticatedApiFetch('/api/customer/profile', session.token)
+        const profile = await profileResponse.json() as CustomerProfile & { error?: string }
+        if (!profileResponse.ok) throw new Error(profile.error || 'Could not load your saved location.')
+        const savedLocation = profile.addresses.find((address) => address.latitude !== null && address.longitude !== null)
+        if (savedLocation && Number.isFinite(savedLocation.latitude) && Number.isFinite(savedLocation.longitude)) {
+          coordinates = { latitude: savedLocation.latitude!, longitude: savedLocation.longitude! }
+        }
+      } catch (requestError) {
+        if (!cancelled) setLocationNotice(requestError instanceof Error ? requestError.message : 'Could not load your saved location.')
+      }
+      if (cancelled) return
+      setOrigin(coordinates)
+      try {
+        const params = new URLSearchParams({ productKey: String(product.id) })
+        if (coordinates) {
+          params.set('latitude', String(coordinates.latitude))
+          params.set('longitude', String(coordinates.longitude))
+        }
+        const response = await fetch(apiUrl(`/api/catalog/compare?${params.toString()}`))
+        const result = await response.json()
+        if (!response.ok) throw new Error(result.error || 'Could not compare pharmacy listings.')
+        if (!cancelled) setComparison(result as ProductComparison)
+      } catch (requestError) {
+        if (!cancelled) setError(requestError instanceof Error ? requestError.message : 'Could not compare pharmacy listings.')
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    }
+    // Load only exact-identity matches for the selected product listing.
+    // oxlint-disable-next-line react/set-state-in-effect
+    void loadComparison()
+    return () => { cancelled = true }
+  }, [product, session.token])
+
+  const loadPharmacyDetails = async (pharmacyId: number) => {
+    if (pharmacyDetailId === pharmacyId) {
+      setPharmacyDetailId(null)
+      return
+    }
+    setDetailError('')
+    try {
+      const params = new URLSearchParams()
+      if (origin) {
+        params.set('latitude', String(origin.latitude))
+        params.set('longitude', String(origin.longitude))
+      }
+      const query = params.size ? `?${params.toString()}` : ''
+      const response = await fetch(apiUrl(`/api/pharmacies/${pharmacyId}${query}`))
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.error || 'Could not load pharmacy details.')
+      setPharmacyDetails((current) => ({ ...current, [pharmacyId]: result }))
+      setPharmacyDetailId(pharmacyId)
+    } catch (requestError) {
+      setDetailError(requestError instanceof Error ? requestError.message : 'Could not load pharmacy details.')
+    }
+  }
+
+  const choosePharmacy = (listing: ProductComparisonListing) => {
+    setCartError('')
+    const selectedProduct: Product = {
+      id: listing.medicineId,
+      pharmacyId: listing.pharmacyId,
+      pharmacyName: listing.pharmacyName,
+      name: listing.name,
+      brandName: listing.brandName,
+      genericName: listing.genericName,
+      strength: listing.strength,
+      dosageForm: listing.dosageForm,
+      packQuantity: listing.packQuantity,
+      packUnit: listing.packUnit,
+      deliveryFee: listing.deliveryFee,
+      pickupAvailable: listing.pickupAvailable,
+      category: listing.category,
+      pack: listing.pack,
+      price: listing.price,
+      stock: listing.availableStock,
+      prescriptionRequired: listing.prescriptionRequired,
+      image: listing.imageUrl || '/pharma-plus-icon.png',
+      description: listing.description || '',
+    }
+    if (!onAddToCart(selectedProduct, quantity)) {
+      setCartError('Could not add this item. Check that the cart contains one pharmacy and the selected quantity is still available.')
+      return
+    }
+    navigate('/cart')
+  }
+
+  if (!product) {
+    return (
+      <main className="screen customer-page-screen">
+        <div className="empty-state-card"><h2>Medicine not found</h2><p>This listing may no longer be available.</p><button type="button" className="accept-action" onClick={() => navigate('/')}>Back to medicines</button></div>
+        <CustomerBottomNav />
+      </main>
+    )
+  }
+
+  return (
+    <motion.main className="screen customer-page-screen compare-page-screen" initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }}>
+      <header className="customer-page-header">
+        <BackButton fallback={`/product/${product.id}`} />
+        <p className="eyebrow">VERIFIED PHARMACY LISTINGS</p>
+        <h1>Compare exact product</h1>
+        <p>Choose one verified pharmacy before adding this medicine to your cart.</p>
+      </header>
+      <section className="compare-product-identity">
+        <img src={product.image} alt="" />
+        <div>
+          <strong>{product.name}</strong>
+          <span>{product.brandName || 'Brand not recorded'} · {product.genericName || 'Generic ingredient not recorded'}</span>
+          <span>{product.strength || 'Strength not recorded'} · {product.dosageForm || 'Dosage form not recorded'}</span>
+          <span>Pack: {product.packQuantity && product.packUnit ? `${product.packQuantity} ${product.packUnit}` : product.pack || 'Dimensions not recorded'}</span>
+        </div>
+      </section>
+      {locationNotice && <p className="compare-location-notice" role="status">{locationNotice} Distance is not shown.</p>}
+      {cartError && <p className="owner-form-error" role="alert">{cartError}</p>}
+      {detailError && <p className="owner-form-error" role="alert">{detailError}</p>}
+      {loading ? <div className="empty-state-card compact-empty">Finding verified pharmacy listings…</div> : null}
+      {error && <p className="owner-form-error" role="alert">{error}</p>}
+      {!loading && comparison && !comparison.product.identityComplete && (
+        <section className="compare-safety-warning" role="alert">
+          <strong>Exact product identity is incomplete</strong>
+          <p>This listing is missing one or more of brand, generic ingredient, strength, dosage form, or pack dimensions. No cross-pharmacy match or substitution is shown. Ask a pharmacist to verify the product before purchasing.</p>
+        </section>
+      )}
+      {!loading && comparison?.product.identityComplete && (
+        <section className="compare-exact-criteria">
+          <strong>Exact match only</strong>
+          <span>Brand, generic ingredient, strength, dosage form, pack quantity, and unit must all match.</span>
+        </section>
+      )}
+      {!loading && comparison?.product.identityComplete && comparison.listings.length === 0 && (
+        <div className="empty-state-card compact-empty">No verified pharmacy currently lists this exact product identity.</div>
+      )}
+      {!loading && comparison?.listings.map((listing) => (
+        <article className="compare-pharmacy-card" key={`${listing.pharmacyId}-${listing.medicineId}`}>
+          <header><div><strong>{listing.pharmacyName}</strong><span>{[listing.city, listing.state].filter(Boolean).join(', ') || 'Verified pharmacy'}</span></div><span className={listing.available ? 'order-status-pill delivered' : 'order-status-pill pending'}>{listing.available ? `${listing.availableStock} available` : 'Out of stock'}</span></header>
+          <div className="compare-price-grid">
+            <div><small>Product price</small><strong>₹{listing.price.toLocaleString('en-IN')}</strong></div>
+            <div><small>Delivery fee</small><strong>{listing.deliveryFee === null ? 'Not disclosed' : `₹${listing.deliveryFee.toLocaleString('en-IN')}`}</strong></div>
+            <div><small>Pickup</small><strong>{listing.pickupAvailable ? 'Available' : 'Not available'}</strong></div>
+            <div><small>Approx. distance</small><strong>{listing.distanceKm === null ? 'Not available' : `${listing.distanceKm} km`}</strong></div>
+          </div>
+          {listing.deliveryFee !== null && (
+            <p className="compare-estimated-total">
+              Estimated total for {quantity} (includes disclosed delivery and estimated tax): ₹{(
+                listing.price * quantity + listing.deliveryFee + Math.round(listing.price * quantity * 0.05 * 100) / 100
+              ).toLocaleString('en-IN')}
+            </p>
+          )}
+          <button type="button" className="quiet-action" onClick={() => void loadPharmacyDetails(listing.pharmacyId)}>{pharmacyDetailId === listing.pharmacyId ? 'Hide pharmacy details' : 'View pharmacy details'}</button>
+          {pharmacyDetailId === listing.pharmacyId && pharmacyDetails[listing.pharmacyId] && (
+            <div className="compare-pharmacy-details">
+              <span>{pharmacyDetails[listing.pharmacyId].address || 'Address not provided'}{listing.city ? `, ${listing.city}` : ''}</span>
+              {pharmacyDetails[listing.pharmacyId].phone && <span>Phone: {pharmacyDetails[listing.pharmacyId].phone}</span>}
+              <span>{pharmacyDetails[listing.pharmacyId].distanceKm === null ? 'Distance not available' : `Approx. straight-line distance: ${pharmacyDetails[listing.pharmacyId].distanceKm} km`}</span>
+            </div>
+          )}
+          <div className="compare-quantity-control">
+            <span>Quantity</span>
+            <button type="button" aria-label="Decrease quantity" disabled={quantity <= 1} onClick={() => setQuantity((current) => Math.max(1, current - 1))}><Minus className="icon" /></button>
+            <strong>{quantity}</strong>
+            <button type="button" aria-label="Increase quantity" disabled={quantity >= listing.availableStock} onClick={() => setQuantity((current) => Math.min(listing.availableStock, current + 1))}><Plus className="icon" /></button>
+          </div>
+          {listing.deliveryFee === null && <p className="compare-location-notice">{listing.pickupAvailable ? 'Delivery is unavailable until a fee is disclosed; pickup may be selected at checkout.' : 'Neither delivery nor pickup is currently available.'}</p>}
+          <button type="button" className="accept-action compare-select-button" disabled={!listing.available || quantity > listing.availableStock || (listing.deliveryFee === null && !listing.pickupAvailable)} onClick={() => choosePharmacy(listing)}>
+            {listing.deliveryFee === null && !listing.pickupAvailable ? 'No fulfillment option available' : `Choose ${listing.pharmacyName} and continue to cart`} <ArrowUpRight className="icon" />
+          </button>
+        </article>
+      ))}
+      {!loading && comparison?.nonIdenticalListings.length ? (
+        <section className="compare-nonidentical-section">
+          <h2>Other listings — not exact matches</h2>
+          <p>These are not equivalent products or recommendations. Brand, strength, dosage form, or pack may differ. Do not substitute; ask a pharmacist to assess any alternative.</p>
+          {comparison.nonIdenticalListings.map((listing) => (
+            <article className="compare-nonidentical-card" key={`${listing.pharmacyId}-${listing.medicineId}`}>
+              <span className="nonidentical-badge">NOT AN EXACT MATCH</span>
+              <strong>{listing.name}</strong>
+              <span>{listing.brandName || 'Brand not recorded'} · {listing.genericName || 'Generic not recorded'} · {listing.strength || 'Strength not recorded'}</span>
+              <span>{listing.dosageForm || 'Form not recorded'} · {listing.packQuantity && listing.packUnit ? `${listing.packQuantity} ${listing.packUnit}` : listing.pack}</span>
+              <small>{listing.pharmacyName} · {listing.available ? 'Available' : 'Out of stock'} · ₹{listing.price.toLocaleString('en-IN')}</small>
+              <strong className="pharmacist-required-label">Pharmacist involvement required before considering</strong>
+            </article>
+          ))}
+        </section>
+      ) : null}
       <CustomerBottomNav />
     </motion.main>
   )
@@ -1221,6 +1754,7 @@ function CustomerOrderTrackingPage({ session }: { session: AccountSession }) {
           </section>
           <section className="tracking-progress-card">
             <h2>Delivery progress</h2>
+            {order.paymentMethod === 'UPI Payment' && order.paymentStatus === 'pending' && <p className="checkout-quote-prompt">UPI payment is pending; it is not considered paid until verified by a payment gateway.</p>}
             <OrderTimeline order={order} />
           </section>
           {otp && order.status !== 'delivered' && (
@@ -1231,10 +1765,10 @@ function CustomerOrderTrackingPage({ session }: { session: AccountSession }) {
           )}
           <section className="tracking-items-card">
             <h2>Items ({order.items.length})</h2>
-            {order.items.map((item) => <div key={`${order.id}-${item.medicineId}`}><span>{item.name} × {item.quantity}</span><strong>₹{item.lineTotal.toLocaleString('en-IN')}</strong></div>)}
+            {order.items.map((item) => <div key={`${order.id}-${item.medicineId}`}><span>{item.name} × {formatOrderItemQuantity(item)}</span><strong>₹{item.lineTotal.toLocaleString('en-IN')}</strong></div>)}
             <div className="tracking-total"><span>Order total</span><strong>₹{order.total.toLocaleString('en-IN')}</strong></div>
           </section>
-          <section className="tracking-address-card"><MapPin className="icon" /><div><strong>Delivery address</strong><span>{order.deliveryAddress}</span></div></section>
+          <section className="tracking-address-card"><MapPin className="icon" /><div><strong>{order.fulfillmentMethod === 'pickup' ? 'Pickup' : 'Delivery location'}</strong><span>{formatOrderLocation(order)}</span></div></section>
         </>
       ) : null}
       <CustomerBottomNav />
@@ -1253,10 +1787,12 @@ function CustomerProfilePage({
   const photoInput = useRef<HTMLInputElement>(null)
   const [profile, setProfile] = useState<CustomerProfile | null>(null)
   const [profileLoading, setProfileLoading] = useState(true)
-  const [editing, setEditing] = useState(false)
-  const [locationMode, setLocationMode] = useState<'manual' | 'current'>('manual')
+  const [editingProfile, setEditingProfile] = useState(false)
+  const [editingAddressId, setEditingAddressId] = useState<number | null>(null)
+  const [addressEditorOpen, setAddressEditorOpen] = useState(false)
   const [locating, setLocating] = useState(false)
   const [profileForm, setProfileForm] = useState<ProfileForm>(emptyProfileForm())
+  const [addressForm, setAddressForm] = useState<AddressForm>(emptyAddressForm())
   const [error, setError] = useState('')
   const [message, setMessage] = useState('')
   const [busy, setBusy] = useState(false)
@@ -1264,41 +1800,47 @@ function CustomerProfilePage({
 
   const applyProfile = (nextProfile: CustomerProfile) => {
     setProfile(nextProfile)
-    const address = nextProfile.addresses[0]
     setProfileForm({
       fullName: nextProfile.user.fullName,
       phone: nextProfile.user.phone ?? '',
-      address: address?.address ?? '',
-      city: address?.city ?? '',
-      state: address?.state ?? '',
-      postalCode: address?.postalCode ?? '',
-      latitude: address?.latitude ?? null,
-      longitude: address?.longitude ?? null,
     })
-    setLocationMode(address?.latitude != null && address.longitude != null ? 'current' : 'manual')
   }
 
   useEffect(() => {
     let cancelled = false
     const loadProfile = async () => {
       try {
-        const response = await authenticatedApiFetch('/api/customer/profile', session.token)
-        const result = await response.json()
-        if (!response.ok) throw new Error(result.error || 'Could not load your profile.')
-        if (!cancelled) applyProfile(result as CustomerProfile)
+        const [profileResponse, addressesResponse] = await Promise.all([
+          authenticatedApiFetch('/api/me/profile', session.token),
+          authenticatedApiFetch('/api/me/addresses', session.token),
+        ])
+        const profileResult = await profileResponse.json()
+        const addressesResult = await addressesResponse.json()
+        if (!profileResponse.ok) throw new Error(profileResult.error || 'Could not load your profile.')
+        if (!addressesResponse.ok) throw new Error(addressesResult.error || 'Could not load your saved addresses.')
+        if (!cancelled) applyProfile({
+          user: profileResult.user,
+          addresses: addressesResult.addresses,
+        } as CustomerProfile)
       } catch (requestError) {
         if (!cancelled) setError(requestError instanceof Error ? requestError.message : 'Could not load your profile.')
       } finally {
         if (!cancelled) setProfileLoading(false)
       }
     }
-    // Load the saved profile for the authenticated customer.
     // oxlint-disable-next-line react/set-state-in-effect
     void loadProfile()
     return () => {
       cancelled = true
     }
   }, [session.token])
+
+  const refreshAddresses = async () => {
+    const response = await authenticatedApiFetch('/api/me/addresses', session.token)
+    const result = await response.json()
+    if (!response.ok) throw new Error(result.error || 'Could not refresh your saved addresses.')
+    setProfile((current) => current ? { ...current, addresses: result.addresses } : current)
+  }
 
   const captureCurrentLocation = () => {
     setError('')
@@ -1310,20 +1852,20 @@ function CustomerProfilePage({
     setLocating(true)
     navigator.geolocation.getCurrentPosition(
       (position) => {
-        setProfileForm((current) => ({
+        setAddressForm((current) => ({
           ...current,
           latitude: position.coords.latitude,
           longitude: position.coords.longitude,
         }))
         setLocating(false)
-        setMessage('Location captured on this device. It will be saved with your profile.')
+        setMessage('GPS coordinates captured. No street lookup was performed.')
       },
       (locationError) => {
         const locationMessage = locationError.code === locationError.PERMISSION_DENIED
-          ? 'Location permission was denied. Allow it in your device settings or enter your address manually.'
+          ? 'Location permission was denied. Allow it in your device settings, try again, or enter an address manually.'
           : locationError.code === locationError.POSITION_UNAVAILABLE
-            ? 'Your current location is unavailable. Try again or enter your address manually.'
-            : 'Location took too long to respond. Try again or enter your address manually.'
+            ? 'Your current location is unavailable. Try again or enter an address manually.'
+            : 'Location took too long to respond. Try again or enter an address manually.'
         setError(locationMessage)
         setLocating(false)
       },
@@ -1337,20 +1879,93 @@ function CustomerProfilePage({
     setError('')
     setMessage('')
     try {
-      const response = await authenticatedApiFetch('/api/customer/profile', session.token, {
-        method: 'PUT',
+      const response = await authenticatedApiFetch('/api/me/profile', session.token, {
+        method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(profileForm),
       })
       const result = await response.json()
       if (!response.ok) throw new Error(result.error || 'Could not save your profile.')
-      applyProfile(result as CustomerProfile)
-      setEditing(false)
+      setProfile((current) => current ? { ...current, user: result.user } : current)
+      setProfileForm({ fullName: result.user.fullName, phone: result.user.phone ?? '' })
+      setEditingProfile(false)
       setMessage('Your profile was saved.')
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : 'Could not save your profile.')
     } finally {
       setBusy(false)
+    }
+  }
+
+  const beginNewAddress = () => {
+    setEditingAddressId(null)
+    setAddressForm({ ...emptyAddressForm(), isDefault: !profile?.addresses.length })
+    setAddressEditorOpen(true)
+    setError('')
+    setMessage('')
+  }
+
+  const beginEditAddress = (address: CustomerAddress) => {
+    setEditingAddressId(address.id)
+    setAddressForm({
+      label: address.label,
+      contactPhone: address.contactPhone ?? '',
+      address: address.address ?? '',
+      city: address.city ?? '',
+      state: address.state ?? '',
+      postalCode: address.postalCode ?? '',
+      latitude: address.latitude,
+      longitude: address.longitude,
+      isDefault: address.isDefault,
+    })
+    setAddressEditorOpen(true)
+    setError('')
+    setMessage('')
+  }
+
+  const saveAddress = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    setBusy(true)
+    setError('')
+    setMessage('')
+    try {
+      const response = await authenticatedApiFetch(
+        editingAddressId === null ? '/api/me/addresses' : `/api/me/addresses/${editingAddressId}`,
+        session.token,
+        {
+          method: editingAddressId === null ? 'POST' : 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(addressForm),
+        },
+      )
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.error || 'Could not save this address.')
+      await refreshAddresses()
+      setAddressEditorOpen(false)
+      setEditingAddressId(null)
+      setMessage('Saved address updated.')
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Could not save this address.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const makeDefault = async (address: CustomerAddress) => {
+    setError('')
+    setMessage('')
+    try {
+      const response = await authenticatedApiFetch(`/api/me/addresses/${address.id}`, session.token, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ isDefault: true }),
+      })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.error || 'Could not set the default address.')
+      await refreshAddresses()
+      setMessage(`${address.label} is now your default address.`)
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Could not set the default address.')
     }
   }
 
@@ -1403,133 +2018,94 @@ function CustomerProfilePage({
             }} />
             <div>
               <h2>{profile.user.fullName}</h2>
-              <p>Customer account</p>
+              <p>Customer account · Profile photo stays on this device</p>
             </div>
             <button
+              type="button"
               className="quiet-action"
               onClick={() => {
-                if (editing) applyProfile(profile)
-                setEditing((current) => !current)
+                if (editingProfile) setProfileForm({ fullName: profile.user.fullName, phone: profile.user.phone ?? '' })
+                setEditingProfile((current) => !current)
+                setError('')
+                setMessage('')
               }}
             >
-              {editing ? 'Cancel' : 'Edit profile'}
+              {editingProfile ? 'Cancel' : 'Edit profile'}
             </button>
           </section>
           <div className="profile-shortcuts">
             <button type="button" onClick={() => navigate('/orders')}><ShoppingBag className="icon" /><span><strong>My orders</strong><small>Track deliveries and order again</small></span><ArrowUpRight className="icon" /></button>
             <button type="button" onClick={() => navigate('/favorites')}><Heart className="icon" /><span><strong>Saved medicines</strong><small>Your favorite pharmacy products</small></span><ArrowUpRight className="icon" /></button>
           </div>
-          {editing ? (
+          {editingProfile ? (
             <form className="profile-edit-card" onSubmit={saveProfile}>
               <div className="profile-edit-heading">
                 <span className="profile-edit-icon"><User className="icon" /></span>
-                <div><h2>Your details</h2><p>Keep your contact and delivery location up to date.</p></div>
+                <div><h2>Your details</h2><p>Update the name and phone number used for your account.</p></div>
               </div>
               <div className="profile-input-grid">
                 <label>Full name<input required minLength={2} value={profileForm.fullName} onChange={(event) => setProfileForm({ ...profileForm, fullName: event.target.value })} /></label>
                 <label>Phone number<input type="tel" autoComplete="tel" value={profileForm.phone} onChange={(event) => setProfileForm({ ...profileForm, phone: event.target.value })} /></label>
               </div>
-              <section className="location-editor">
-                <div className="location-editor-heading">
-                  <span className="location-editor-icon"><MapPin className="icon" /></span>
-                  <div><h3>Delivery location</h3><p>Use your current GPS location or type the address yourself.</p></div>
-                </div>
-                <div className="location-choice-grid">
-                  <button
-                    type="button"
-                    className={locationMode === 'current' ? 'location-choice selected' : 'location-choice'}
-                    aria-pressed={locationMode === 'current'}
-                    onClick={() => {
-                      setLocationMode('current')
-                      setProfileForm((current) => ({
-                        ...current,
-                        address: '',
-                        city: '',
-                        state: '',
-                        postalCode: '',
-                      }))
-                      if (profileForm.latitude === null || profileForm.longitude === null) captureCurrentLocation()
-                    }}
-                  >
-                    <MapPin className="icon" />
-                    <span><strong>Use current location</strong><small>Ask this device for GPS permission</small></span>
-                    {locationMode === 'current' && <Check className="icon location-choice-check" />}
-                  </button>
-                  <button
-                    type="button"
-                    className={locationMode === 'manual' ? 'location-choice selected' : 'location-choice'}
-                    aria-pressed={locationMode === 'manual'}
-                    onClick={() => {
-                      setLocationMode('manual')
-                      setProfileForm((current) => ({ ...current, latitude: null, longitude: null }))
-                      setError('')
-                      setMessage('')
-                    }}
-                  >
-                    <Pencil className="icon" />
-                    <span><strong>Enter manually</strong><small>Type a street address and city</small></span>
-                    {locationMode === 'manual' && <Check className="icon location-choice-check" />}
-                  </button>
-                </div>
-                {locationMode === 'current' ? (
-                  <div className="current-location-card">
-                    {profileForm.latitude !== null && profileForm.longitude !== null ? (
-                      <>
-                        <span className="location-live-dot" />
-                        <div><strong>Location captured</strong><span>{profileForm.latitude.toFixed(5)}, {profileForm.longitude.toFixed(5)}</span></div>
-                        <button type="button" className="text-action" onClick={captureCurrentLocation} disabled={locating}>
-                          {locating ? 'Locating…' : 'Refresh'}
-                        </button>
-                      </>
-                    ) : (
-                      <>
-                        <span className="location-live-dot muted" />
-                        <div><strong>{locating ? 'Finding your location…' : 'Location not captured yet'}</strong><span>Coordinates stay in your profile and are not sent to a lookup service.</span></div>
-                        {!locating && <button type="button" className="text-action" onClick={captureCurrentLocation}>Try again</button>}
-                      </>
-                    )}
-                  </div>
-                ) : (
-                  <div className="profile-input-grid location-address-fields">
-                    <label className="profile-field-wide">Street address<input autoComplete="street-address" placeholder="House number and street" value={profileForm.address} onChange={(event) => setProfileForm({ ...profileForm, address: event.target.value })} /></label>
-                    <label>City<input autoComplete="address-level2" value={profileForm.city} onChange={(event) => setProfileForm({ ...profileForm, city: event.target.value })} /></label>
-                    <label>State<input autoComplete="address-level1" value={profileForm.state} onChange={(event) => setProfileForm({ ...profileForm, state: event.target.value })} /></label>
-                    <label>Postal code<input autoComplete="postal-code" value={profileForm.postalCode} onChange={(event) => setProfileForm({ ...profileForm, postalCode: event.target.value })} /></label>
-                  </div>
-                )}
-              </section>
-              {error && <p className="owner-form-error" role="alert">{error}</p>}
-              {message && <p className="success-message" role="status">{message}</p>}
               <button type="submit" className="accept-action" disabled={busy || locating}>{busy ? 'Saving…' : 'Save profile'}</button>
             </form>
-          ) : (
-            <div className="profile-contact-card">
-              <div><User className="icon" /><span>{profile.user.fullName}</span></div>
-              <div><Mail className="icon" /><span>{profile.user.email}</span></div>
-              {profile.user.phone && <div><Phone className="icon" /><span>{profile.user.phone}</span></div>}
-              {profile.addresses[0] && (
-                <div>
-                  <MapPin className="icon" />
-                  <span>
-                    {[
-                      profile.addresses[0].address,
-                      profile.addresses[0].city,
-                      profile.addresses[0].state,
-                      profile.addresses[0].postalCode,
-                    ].filter(Boolean).join(', ') || (
-                      profile.addresses[0].latitude !== null && profile.addresses[0].longitude !== null
-                        ? `${profile.addresses[0].latitude.toFixed(5)}, ${profile.addresses[0].longitude.toFixed(5)}`
-                        : 'No delivery location saved'
-                    )}
-                  </span>
-                </div>
-              )}
-              {!profile.addresses[0] && <p className="profile-empty-location">Add a delivery location to make checkout easier.</p>}
+          ) : <div className="profile-contact-card">
+            <div><User className="icon" /><span>{profile.user.fullName}</span></div>
+            <div><Mail className="icon" /><span>{profile.user.email}</span></div>
+            {profile.user.phone && <div><Phone className="icon" /><span>{profile.user.phone}</span></div>}
+          </div>}
+          <section className="profile-edit-card">
+            <div className="profile-edit-heading">
+              <span className="location-editor-icon"><MapPin className="icon" /></span>
+              <div><h2>Saved addresses</h2><p>Manage delivery addresses or GPS coordinates. GPS is requested only when you choose Use GPS.</p></div>
+              <button type="button" className="quiet-action" onClick={beginNewAddress}>Add address</button>
             </div>
-          )}
+            {profile.addresses.length ? (
+              <div className="profile-address-list">
+                {profile.addresses.map((address) => (
+                  <article className="profile-contact-card" key={address.id}>
+                    <div><MapPin className="icon" /><span><strong>{address.label}</strong>{address.isDefault && <small> · Default</small>}</span></div>
+                    <div><span>{formatCustomerAddress(address) || 'No address details saved'}</span></div>
+                    {address.contactPhone && <div><Phone className="icon" /><span>{address.contactPhone}</span></div>}
+                    <div className="profile-address-actions">
+                      {!address.isDefault && <button type="button" className="text-action" onClick={() => void makeDefault(address)}>Make default</button>}
+                      <button type="button" className="text-action" onClick={() => beginEditAddress(address)}>Edit</button>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            ) : <p className="profile-empty-location">No saved addresses yet. Add a manual address or GPS coordinates.</p>}
+            {addressEditorOpen && (
+              <form className="location-editor" onSubmit={saveAddress}>
+                <div className="location-editor-heading">
+                  <span className="location-editor-icon"><Pencil className="icon" /></span>
+                  <div><h3>{editingAddressId === null ? 'Add an address' : 'Edit address'}</h3><p>Enter a manual location, use GPS, or save both.</p></div>
+                </div>
+                <div className="profile-input-grid">
+                  <label>Label<input required maxLength={60} placeholder="Home, work..." value={addressForm.label} onChange={(event) => setAddressForm({ ...addressForm, label: event.target.value })} /></label>
+                  <label>Contact phone<input type="tel" autoComplete="tel" value={addressForm.contactPhone} onChange={(event) => setAddressForm({ ...addressForm, contactPhone: event.target.value })} /></label>
+                  <label className="profile-field-wide">Street address<input autoComplete="street-address" placeholder="House number and street (optional when using GPS)" value={addressForm.address} onChange={(event) => setAddressForm({ ...addressForm, address: event.target.value })} /></label>
+                  <label>City<input autoComplete="address-level2" value={addressForm.city} onChange={(event) => setAddressForm({ ...addressForm, city: event.target.value })} /></label>
+                  <label>State<input autoComplete="address-level1" value={addressForm.state} onChange={(event) => setAddressForm({ ...addressForm, state: event.target.value })} /></label>
+                  <label>Postal code<input autoComplete="postal-code" value={addressForm.postalCode} onChange={(event) => setAddressForm({ ...addressForm, postalCode: event.target.value })} /></label>
+                  <label>Latitude<input type="number" step="any" min="-90" max="90" value={addressForm.latitude ?? ''} onChange={(event) => setAddressForm({ ...addressForm, latitude: event.target.value === '' ? null : Number(event.target.value) })} /></label>
+                  <label>Longitude<input type="number" step="any" min="-180" max="180" value={addressForm.longitude ?? ''} onChange={(event) => setAddressForm({ ...addressForm, longitude: event.target.value === '' ? null : Number(event.target.value) })} /></label>
+                </div>
+                <button type="button" className="location-choice" onClick={captureCurrentLocation} disabled={locating}>
+                  <MapPin className="icon" /><span><strong>{locating ? 'Requesting location…' : 'Use GPS'}</strong><small>Only this button asks your device for location permission.</small></span>
+                </button>
+                {addressForm.latitude !== null && addressForm.longitude !== null && <p className="profile-empty-location">Coordinates: {addressForm.latitude.toFixed(5)}, {addressForm.longitude.toFixed(5)}. No reverse lookup is used.</p>}
+                <label className="profile-default-address"><input type="checkbox" checked={addressForm.isDefault} onChange={(event) => setAddressForm({ ...addressForm, isDefault: event.target.checked })} /> Set as default delivery address</label>
+                <div className="profile-address-actions">
+                  <button type="submit" className="accept-action" disabled={busy || locating}>{busy ? 'Saving…' : 'Save address'}</button>
+                  <button type="button" className="text-action" onClick={() => { setAddressEditorOpen(false); setError('') }}>Cancel</button>
+                </div>
+              </form>
+            )}
+          </section>
           {message && <p className="success-message" role="status">{message}</p>}
           {error && <p className="owner-form-error" role="alert">{error}</p>}
-          <button className="profile-sign-out-button" onClick={onSignOut}><LogOut className="icon" /> Sign out</button>
+          <button type="button" className="profile-sign-out-button" onClick={onSignOut}><LogOut className="icon" /> Sign out</button>
         </>
       ) : (
         <div className="empty-state-card compact-empty">
@@ -1548,23 +2124,26 @@ function ProductDetailPage({
   onAddToCart,
   onToggleFavorite,
   favoriteIds,
-  cartError,
+  favoritesError,
   onReviewsChanged,
   reviewsOnly = false,
 }: {
   products: Product[]
   session: AccountSession
   onAddToCart: (product: Product, quantity: number) => boolean
-  onToggleFavorite: (productId: number) => void
+  onToggleFavorite: (productId: number) => Promise<boolean>
   favoriteIds: number[]
-  cartError: string
+  favoritesError: string
   onReviewsChanged: () => void
   reviewsOnly?: boolean
 }) {
   const navigate = useNavigate()
   const { id } = useParams()
-  const product = products.find((item) => item.id === Number(id))
-  const productId = product?.id
+  const productId = Number(id)
+  const [product, setProduct] = useState<Product | null>(() => products.find((item) => item.id === productId) ?? null)
+  const [recommendations, setRecommendations] = useState<Product[]>([])
+  const [productLoading, setProductLoading] = useState(true)
+  const [productError, setProductError] = useState('')
   const [quantity, setQuantity] = useState(1)
   const [reviews, setReviews] = useState<Array<{ id: number; rating: number; comment: string; createdAt: string; customerName: string }>>([])
   const [averageRating, setAverageRating] = useState(0)
@@ -1575,12 +2154,56 @@ function ProductDetailPage({
   const [reviewError, setReviewError] = useState('')
   const [reviewMessage, setReviewMessage] = useState('')
   const [reviewSaving, setReviewSaving] = useState(false)
-  const [addingError, setAddingError] = useState('')
+  const [cartActionError, setCartActionError] = useState('')
+
+  useEffect(() => {
+    let cancelled = false
+    const loadProduct = async () => {
+      if (!Number.isSafeInteger(productId) || productId < 1) {
+        setProduct(null)
+        setProductLoading(false)
+        return
+      }
+      setProductLoading(true)
+      setProductError('')
+      try {
+        const response = await fetch(apiUrl(`/api/medicines/${productId}`))
+        const result = await response.json() as {
+          medicine?: Product & {
+            availableStock: number
+            availabilityReason: string | null
+            warnings: string[]
+            manufacturer: string | null
+            batchNumber: string | null
+            expiryDate: string | null
+          }
+          recommendations?: Product[]
+          error?: string
+        }
+        if (!response.ok || !result.medicine) throw new Error(result.error || 'Could not load this medicine.')
+        const medicine = result.medicine
+        if (cancelled) return
+        setProduct({ ...medicine, stock: medicine.availableStock, image: medicine.imageUrl || '/pharma-plus-icon.png' } as Product)
+        setRecommendations(result.recommendations ?? [])
+      } catch (requestError) {
+        if (!cancelled) {
+          setProductError(requestError instanceof Error ? requestError.message : 'Could not load this medicine.')
+          setProduct(null)
+        }
+      } finally {
+        if (!cancelled) setProductLoading(false)
+      }
+    }
+    // Load the authoritative scoped medicine record, not only the browse-card summary.
+    // oxlint-disable-next-line react/set-state-in-effect
+    void loadProduct()
+    return () => { cancelled = true }
+  }, [productId])
 
   useEffect(() => {
     let cancelled = false
     const loadReviews = async () => {
-      if (!productId) return
+      if (!Number.isSafeInteger(productId) || productId < 1) return
       try {
         const [reviewsResponse, ordersResponse] = await Promise.all([
           fetch(apiUrl(`/api/catalog/medicines/${productId}/reviews`)),
@@ -1637,25 +2260,34 @@ function ProductDetailPage({
     }
   }
 
+  const addProductToCart = (buyNow = false) => {
+    if (!product) return
+    setCartActionError('')
+    if (!onAddToCart(product, quantity)) {
+      setCartActionError('Could not add this item. Check available stock and make sure your cart is from the same pharmacy.')
+      return
+    }
+    navigate(buyNow ? '/checkout' : '/cart')
+  }
+
+  if (productLoading) {
+    return <main className="screen"><div className="empty-state-card compact-empty">Loading medicine details…</div></main>
+  }
   if (!product) {
     return (
       <div className="empty-state-card">
-        <h2>Medicine not found</h2>
-        <p>This medicine may no longer be available.</p>
+        <h2>Medicine unavailable</h2>
+        <p>{productError || 'This medicine may no longer be available.'}</p>
         <button className="accept-action" onClick={() => navigate('/')}>Back to medicines</button>
       </div>
     )
   }
-    const recommended = products
-      .filter((item) => item.id !== product.id && item.category === product.category)
-      .slice(0, 6)
-
   return (
     <motion.div initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -18 }} className={reviewsOnly ? 'screen details-screen reviews-only-screen' : 'screen details-screen'}>
       <header className="topbar detail-topbar">
         <BackButton fallback="/" />
         {reviewsOnly ? <h2>Medicine Reviews</h2> : null}
-        <button type="button" className={favoriteIds.includes(product.id) ? 'icon-button light selected' : 'icon-button light'} aria-label={favoriteIds.includes(product.id) ? 'Remove from favorites' : 'Add to favorites'} onClick={() => onToggleFavorite(product.id)}>
+        <button type="button" className={favoriteIds.includes(product.id) ? 'icon-button light selected' : 'icon-button light'} aria-label={favoriteIds.includes(product.id) ? 'Remove from favorites' : 'Add to favorites'} onClick={() => void onToggleFavorite(product.id)}>
           <Heart className="icon" />
         </button>
       </header>
@@ -1670,6 +2302,10 @@ function ProductDetailPage({
             <h2>{product.name}</h2>
             <small>{product.pack}</small>
             <p className="detail-pharmacy-name"><MapPin className="icon" /> {product.pharmacyName}</p>
+            <p>{[product.brandName, product.genericName, product.strength, product.dosageForm].filter(Boolean).join(' · ') || 'Product identity details not recorded'}</p>
+            {product.manufacturer && <p>Manufacturer: {product.manufacturer}</p>}
+            {product.batchNumber && <p>Batch: {product.batchNumber}</p>}
+            {product.expiryDate && <p>Expiry: {product.expiryDate.slice(0, 10)}</p>}
           </div>
           <div className="rating-badge">
             <Star className="star-icon" />
@@ -1680,11 +2316,11 @@ function ProductDetailPage({
         <div className="price-row">
           <strong>₹{product.price.toLocaleString('en-IN')}</strong>
           <div className="quantity-control">
-            <button onClick={() => setQuantity((value) => Math.max(1, value - 1))} aria-label="Decrease quantity" disabled={quantity <= 1}>
+            <button type="button" onClick={() => setQuantity((value) => Math.max(1, value - 1))} aria-label="Decrease quantity" disabled={quantity <= 1 || !product.available}>
               <Minus className="icon" />
             </button>
             <span>{quantity}</span>
-            <button onClick={() => setQuantity((value) => Math.min(product.stock, value + 1))} aria-label="Increase quantity" disabled={quantity >= product.stock}>
+            <button type="button" onClick={() => setQuantity((value) => Math.min(product.stock, value + 1))} aria-label="Increase quantity" disabled={!product.available || quantity >= product.stock}>
               <Plus className="icon" />
             </button>
           </div>
@@ -1692,65 +2328,47 @@ function ProductDetailPage({
 
         <div className="tablet-strip-wrap">
           <div className="tablet-strip-header">
-            <span>Tablet strip</span>
-            <span>{quantity} selected</span>
+            <span>Quantity</span>
+            <span>{quantity} pack(s)</span>
           </div>
-          <div className="tablet-strip">
-            {Array.from({ length: 10 }, (_, index) => {
-              const active = index < quantity
-              return (
-                <motion.button
-                  key={index}
-                  type="button"
-                  disabled={index >= product.stock}
-                  aria-label={`Select quantity ${index + 1}`}
-                  aria-pressed={quantity === index + 1}
-                  onClick={() => setQuantity(index + 1)}
-                  layout
-                  initial={false}
-                  animate={{
-                    scale: active ? 1 : 0.95,
-                    opacity: active ? 1 : 0.5,
-                    background: active ? '#83B900' : '#f0f1f2',
-                    color: active ? '#fff' : '#050505',
-                  }}
-                  transition={{ duration: 0.2 }}
-                  className="tablet-pill"
-                >
-                  {index + 1}
-                </motion.button>
-              )
-            })}
-          </div>
+          <p>{product.packQuantity && product.packUnit
+            ? `${quantity * product.packQuantity} ${product.packUnit} total`
+            : 'Pack-to-unit conversion is unavailable until pack dimensions are recorded.'}</p>
         </div>
 
+        {!product.available && (
+          <p className="owner-form-error" role="status">
+            {product.availabilityReason === 'expired' || product.availabilityReason === 'expired_batches'
+              ? 'Unavailable: expired medicine stock is excluded from sellable inventory.'
+              : product.availabilityReason === 'inactive'
+                ? 'Unavailable: this pharmacy listing is inactive.'
+                : 'Currently out of stock.'}
+          </p>
+        )}
+        {product.warnings?.map((warning) => <p className="compare-location-notice" key={warning} role="note">{warning}</p>)}
         <div className="description-block">
           <div className="section-header compact">
             <h3>Description</h3>
           </div>
           <p>{product.description || 'Product information has not been added yet.'}</p>
         </div>
-        {cartError && <p className="owner-form-error" role="alert">{cartError}</p>}
-        {addingError && <p className="owner-form-error" role="alert">{addingError}</p>}
-
-        <div className="product-detail-actions">
-        <button
-          className="primary-cta secondary-cta"
-          onClick={() => {
-            if (onAddToCart(product, quantity)) navigate('/cart')
-            else setAddingError('Your cart already has medicines from another pharmacy. Finish or clear that order before switching stores.')
-          }}
-        >
-          <Plus className="icon" /> Add to cart
-        </button>
-        <button
-          className="primary-cta"
-          onClick={() => {
-            if (onAddToCart(product, quantity)) navigate('/checkout')
-            else setAddingError('Your cart already has medicines from another pharmacy. Finish or clear that order before switching stores.')
-          }}
-        >Buy now <ArrowUpRight className="icon" /></button>
-        </div>
+        {!reviewsOnly && (
+          <>
+            <div className="product-detail-actions">
+              <button type="button" className="primary-cta secondary-cta" disabled={!product.available || product.stock < 1} onClick={() => addProductToCart()}>
+                <ShoppingBag className="icon" /> Add to cart
+              </button>
+              <button type="button" className="primary-cta" disabled={!product.available || product.stock < 1} onClick={() => addProductToCart(true)}>
+                Buy now <ArrowUpRight className="icon" />
+              </button>
+              <button type="button" className="primary-cta secondary-cta product-detail-compare" disabled={!product.available || product.stock < 1} onClick={() => navigate(`/compare/${product.id}`, { state: { quantity } })}>
+                Compare prices & choose pharmacy
+              </button>
+            </div>
+            {cartActionError && <p className="owner-form-error" role="alert">{cartActionError}</p>}
+          </>
+        )}
+        {favoritesError && <p className="owner-form-error" role="alert">{favoritesError}</p>}
         <section className="product-review-section">
           <div className="product-review-product"><img src={product.image} alt="" /><div><strong>{product.name}</strong><span>{product.pharmacyName}</span></div><span className={canReview ? 'order-status-pill delivered' : 'order-status-pill pending'}>{canReview ? 'Delivered' : 'Not delivered'}</span></div>
           <header className="product-review-heading"><div><h3>Customer reviews</h3><p>{reviewCount ? `${averageRating.toFixed(1)} average · ${reviewCount} verified reviews` : 'Be the first to share a verified-purchase review.'}</p></div><button type="button" onClick={() => navigate(`/product/${product.id}/reviews`)}>See all</button></header>
@@ -1760,7 +2378,7 @@ function ProductDetailPage({
             <form className="product-review-form" onSubmit={submitReview}>
               <span>Rate your delivered medicine</span>
               <div className="review-star-picker">{[1, 2, 3, 4, 5].map((rating) => (
-                <button type="button" key={rating} aria-label={`${rating} stars`} aria-pressed={reviewRating === rating} onClick={() => setReviewRating(rating)}><Star className="star-icon" /></button>
+                <button type="button" key={rating} aria-label={`Rate ${rating} out of 5 stars`} aria-pressed={reviewRating === rating} data-filled={reviewRating >= rating} onClick={() => setReviewRating(rating)}><Star className="star-icon" /></button>
               ))}</div>
               <textarea rows={3} maxLength={500} placeholder="Share a helpful comment (optional)" value={reviewComment} onChange={(event) => setReviewComment(event.target.value)} />
               <button type="submit" className="accept-action" disabled={reviewSaving}>{reviewSaving ? 'Saving…' : 'Post review'}</button>
@@ -1774,16 +2392,17 @@ function ProductDetailPage({
             </article>
           ))}</div>
         </section>
-        {recommended.length > 0 && (
-          <section className="recommended-products">
-            <h3>Recommended for you</h3>
-            <div className="recommended-product-row">{recommended.map((item) => (
+        <section className="recommended-products">
+          <h3>More in {product.category} at {product.pharmacyName}</h3>
+          {recommendations.length ? (
+            <div className="recommended-product-row">{recommendations.map((item) => (
               <button type="button" className="recommended-product-card" key={item.id} onClick={() => navigate(`/product/${item.id}`)}>
-                <img src={item.image} alt="" /><span><strong>{item.name}</strong><small>{item.pack} · ₹{item.price.toLocaleString('en-IN')}</small></span>
+                <img src={item.imageUrl || '/pharma-plus-icon.png'} alt="" />
+                <span><strong>{item.name}</strong><small>{item.pack} · ₹{item.price.toLocaleString('en-IN')}</small></span>
               </button>
             ))}</div>
-          </section>
-        )}
+          ) : <p>No other in-stock products in this category at this pharmacy.</p>}
+        </section>
       </motion.div>
     </motion.div>
   )
@@ -1793,68 +2412,201 @@ function CheckoutPage({
   cart,
   cartError,
   session,
-  subtotal,
   paymentMethod,
   setPaymentMethod,
   onClearCart,
-  total,
 }: {
   cart: CartItem[]
   cartError: string
   session: AccountSession
-  subtotal: number
   paymentMethod: string
   setPaymentMethod: (method: string) => void
   onClearCart: () => void
-  total: number
 }) {
   const navigate = useNavigate()
-  const [deliveryAddress, setDeliveryAddress] = useState('')
+  const [addresses, setAddresses] = useState<CustomerAddress[]>([])
+  const [selectedAddressId, setSelectedAddressId] = useState<number | null>(null)
+  const [fulfillmentMethod, setFulfillmentMethod] = useState<'delivery' | 'pickup'>('delivery')
+  const [discountCode, setDiscountCode] = useState('')
+  const [quote, setQuote] = useState<CheckoutQuote | null>(null)
+  const [quoteRequestKey, setQuoteRequestKey] = useState('')
   const [addressLoading, setAddressLoading] = useState(true)
+  const [quoteLoading, setQuoteLoading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState(cartError)
-  const deliveryCharge = subtotal > 0 ? 49 : 0
-  const tax = subtotal > 0 ? Math.round(subtotal * 0.05 * 100) / 100 : 0
+  const [prescriptions, setPrescriptions] = useState<PrescriptionRecord[]>([])
+  const [selectedPrescriptionId, setSelectedPrescriptionId] = useState<number | null>(null)
+  const [prescriptionFile, setPrescriptionFile] = useState<File | null>(null)
+  const [prescriptionError, setPrescriptionError] = useState('')
+  const [prescriptionMessage, setPrescriptionMessage] = useState('')
+  const [uploadingPrescription, setUploadingPrescription] = useState(false)
+  const prescriptionFileInput = useRef<HTMLInputElement>(null)
+  const [today] = useState(() => new Date().toISOString().slice(0, 10))
+  const selectedAddress = addresses.find((address) => address.id === selectedAddressId) ?? null
+  const restrictedItems = cart.filter((item) => item.prescriptionRequired)
+  const requiredMedicineIds = restrictedItems.map((item) => item.id)
+  const eligiblePrescriptions = prescriptions.filter((prescription) =>
+    prescription.status === 'approved' &&
+    prescription.documentAvailable &&
+    prescription.validUntil !== null &&
+    prescription.validUntil >= today &&
+    restrictedItems.every((item) => {
+      const approval = prescription.items.find((entry) => entry.medicineId === item.id)
+      return approval !== undefined && approval.remainingQuantity >= item.quantity
+    }),
+  )
+  const selectedPrescription = eligiblePrescriptions.find((entry) => entry.id === selectedPrescriptionId) ?? null
+  const checkoutPayload = () => ({
+    items: cart.map((item) => ({
+      medicineId: item.id,
+      pharmacy_id: item.pharmacy_id,
+      quantity: item.quantity,
+      ...(item.prescriptionRequired && selectedPrescription ? { prescriptionId: selectedPrescription.id } : {}),
+    })),
+    paymentMethod,
+    fulfillmentMethod,
+    ...(fulfillmentMethod === 'delivery' ? { addressId: selectedAddressId } : {}),
+    discountCode: discountCode.trim() || null,
+  })
+  const currentQuoteRequestKey = JSON.stringify(checkoutPayload())
+  const activeQuote = quote && quoteRequestKey === currentQuoteRequestKey ? quote : null
+  const loadPrescriptions = useCallback(async () => {
+    const response = await authenticatedApiFetch('/api/me/prescriptions', session.token)
+    const result = await response.json()
+    if (!response.ok) throw new Error(result.error || 'Could not load your prescription status.')
+    setPrescriptions(result as PrescriptionRecord[])
+  }, [session.token])
 
   useEffect(() => {
     let cancelled = false
-    const loadAddress = async () => {
+    const loadAddresses = async () => {
       try {
-        const response = await authenticatedApiFetch('/api/customer/profile', session.token)
+        const response = await authenticatedApiFetch('/api/me/addresses', session.token)
         const result = await response.json()
-        if (!response.ok) throw new Error(result.error || 'Could not load your delivery location.')
-        const address = (result as CustomerProfile).addresses[0]
-        const formatted = address
-          ? [address.address, address.city, address.state, address.postalCode].filter(Boolean).join(', ') ||
-            (address.latitude !== null && address.longitude !== null ? `GPS ${address.latitude}, ${address.longitude}` : '')
-          : ''
-        if (!cancelled) setDeliveryAddress(formatted)
+        if (!response.ok) throw new Error(result.error || 'Could not load your saved addresses.')
+        const savedAddresses = result.addresses as CustomerAddress[]
+        if (!cancelled) {
+          setAddresses(savedAddresses)
+          setSelectedAddressId((current) => current ?? savedAddresses.find((address) => address.isDefault)?.id ?? savedAddresses[0]?.id ?? null)
+        }
       } catch (requestError) {
-        if (!cancelled) setError(requestError instanceof Error ? requestError.message : 'Could not load your delivery location.')
+        if (!cancelled) setError(requestError instanceof Error ? requestError.message : 'Could not load your saved addresses.')
       } finally {
         if (!cancelled) setAddressLoading(false)
       }
     }
-    // Load the saved destination used by the order API.
     // oxlint-disable-next-line react/set-state-in-effect
-    void loadAddress()
+    void loadAddresses()
     return () => { cancelled = true }
   }, [session.token])
+
+  useEffect(() => {
+    let cancelled = false
+    const load = async () => {
+      try {
+        await loadPrescriptions()
+      } catch (requestError) {
+        if (!cancelled) setPrescriptionError(requestError instanceof Error ? requestError.message : 'Could not load your prescription status.')
+      }
+    }
+    void load()
+    return () => { cancelled = true }
+  }, [loadPrescriptions])
+
+  const uploadPrescription = async () => {
+    if (!prescriptionFile) {
+      setPrescriptionError('Choose a PDF, JPEG, or PNG prescription first.')
+      return
+    }
+    if (prescriptionFile.size > 5 * 1024 * 1024) {
+      setPrescriptionError('Prescription files must be 5 MB or smaller.')
+      return
+    }
+    setUploadingPrescription(true)
+    setPrescriptionError('')
+    setPrescriptionMessage('')
+    try {
+      const formData = new FormData()
+      formData.append('file', prescriptionFile)
+      formData.append('items', JSON.stringify(restrictedItems.map((item) => ({
+        medicineId: item.id,
+        quantity: item.quantity,
+      }))))
+      const response = await authenticatedApiFetch('/api/me/prescriptions', session.token, {
+        method: 'POST',
+        body: formData,
+      })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.error || 'Could not upload your prescription.')
+      setPrescriptionMessage(`Document uploaded for pharmacist review (reference #${result.id}). Restricted items stay blocked until approved.`)
+      setPrescriptionFile(null)
+      if (prescriptionFileInput.current) prescriptionFileInput.current.value = ''
+      try {
+        await loadPrescriptions()
+      } catch (refreshError) {
+        setPrescriptionError(refreshError instanceof Error ? `Upload succeeded, but status could not refresh: ${refreshError.message}` : 'Upload succeeded, but prescription status could not refresh.')
+      }
+    } catch (requestError) {
+      setPrescriptionError(requestError instanceof Error ? requestError.message : 'Could not upload your prescription.')
+    } finally {
+      setUploadingPrescription(false)
+    }
+  }
+
+  const requestQuote = async () => {
+    setQuoteLoading(true)
+    setError('')
+    setQuote(null)
+    setQuoteRequestKey('')
+    const payload = checkoutPayload()
+    const requestKey = JSON.stringify(payload)
+    try {
+      const response = await authenticatedApiFetch('/api/checkout/quote', session.token, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+      const result = await response.json()
+      if (!response.ok) {
+        const corrections = Array.isArray(result.corrections)
+          ? result.corrections.map((item: { name?: string; requestedQuantity: number; availableQuantity: number }) =>
+            `${item.name || 'Medicine'}: requested ${item.requestedQuantity}, available ${item.availableQuantity}`).join('; ')
+          : ''
+        throw new Error([result.error || 'Could not confirm current prices and stock.', corrections].filter(Boolean).join(' '))
+      }
+      setQuote(result as CheckoutQuote)
+      setQuoteRequestKey(requestKey)
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Could not confirm current prices and stock.')
+    } finally {
+      setQuoteLoading(false)
+    }
+  }
 
   const placeOrder = async () => {
     setSaving(true)
     setError('')
     try {
-      const response = await authenticatedApiFetch('/api/customer/orders', session.token, {
+      if (!activeQuote) throw new Error('Request a confirmed quote before placing your order.')
+      const response = await authenticatedApiFetch('/api/orders', session.token, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          items: cart.map((item) => ({ medicineId: item.id, quantity: item.quantity })),
-          paymentMethod,
+          ...checkoutPayload(),
+          quoteId: activeQuote.quoteId,
         }),
       })
       const result = await response.json()
-      if (!response.ok) throw new Error(result.error || 'Could not place your order.')
+      if (!response.ok) {
+        if (result.quote) {
+          setQuote(result.quote as CheckoutQuote)
+          setQuoteRequestKey(currentQuoteRequestKey)
+        } else {
+          setQuote(null)
+          setQuoteRequestKey('')
+        }
+        throw new Error(result.error || 'Could not place your order.')
+      }
       const order = result as CustomerOrder
       localStorage.setItem(`pharma-plus-delivery-otp-${session.user.id}-${order.id}`, order.deliveryOtp ?? '')
       onClearCart()
@@ -1890,39 +2642,135 @@ function CheckoutPage({
         <div className="checkout-section-heading"><span className="checkout-section-icon"><User className="icon" /></span><div><h3>Delivery contact</h3><p>Confirm the details for this order.</p></div></div>
         <div className="checkout-contact-card">
           <div><span className="meta-label">Name</span><strong>{session.user.fullName}</strong></div>
-          <div><span className="meta-label">Phone</span><strong>{session.user.phone || 'Add a phone number in your profile'}</strong></div>
+          <div><span className="meta-label">Phone</span><strong>{(fulfillmentMethod === 'delivery' ? selectedAddress?.contactPhone : null) || session.user.phone || 'Add a phone number in your profile'}</strong></div>
         </div>
-        <div className="checkout-section-heading"><span className="checkout-section-icon"><MapPin className="icon" /></span><div><h3>Delivery location</h3><p>Use your saved GPS location or enter an address in your profile.</p></div></div>
-        <div className="address-card">
-          <div className="address-header">
-            <h4>{addressLoading ? 'Loading saved location…' : 'Saved delivery address'}</h4>
-            <button type="button" onClick={() => navigate('/profile')}>Edit</button>
-          </div>
-          <div className="address-body">
-            <div className="address-meta"><span className="meta-label">Address</span><strong>{addressLoading ? 'Loading saved location…' : deliveryAddress || 'Add an address or GPS location in your profile'}</strong></div>
-          </div>
+        <div className="checkout-section-heading"><span className="checkout-section-icon"><PackageCheck className="icon" /></span><div><h3>Fulfillment</h3><p>Choose delivery or collect your order from the pharmacy.</p></div></div>
+        <div className="payment-stack" role="group" aria-label="Fulfillment method">
+          <button type="button" className={fulfillmentMethod === 'delivery' ? 'payment-option selected' : 'payment-option'} onClick={() => { setQuote(null); setFulfillmentMethod('delivery') }} aria-pressed={fulfillmentMethod === 'delivery'}>
+            <span>Delivery</span>{fulfillmentMethod === 'delivery' ? <Check className="icon" /> : <span className="dot" />}
+          </button>
+          <button type="button" className={fulfillmentMethod === 'pickup' ? 'payment-option selected' : 'payment-option'} onClick={() => { setQuote(null); setFulfillmentMethod('pickup') }} aria-pressed={fulfillmentMethod === 'pickup'}>
+            <span>Pharmacy pickup</span>{fulfillmentMethod === 'pickup' ? <Check className="icon" /> : <span className="dot" />}
+          </button>
         </div>
-        <div className="checkout-section-heading"><span className="checkout-section-icon"><PackageCheck className="icon" /></span><div><h3>Order summary</h3><p>{cart.reduce((sum, item) => sum + item.quantity, 0)} medicine unit(s)</p></div></div>
-        <div className="summary-row"><span>Subtotal</span><strong>₹{subtotal.toLocaleString('en-IN')}</strong></div>
-        <div className="summary-row"><span>Delivery Charge</span><strong>₹{deliveryCharge}</strong></div>
-        <div className="summary-row"><span>Tax</span><strong>₹{tax}</strong></div>
-        <div className="summary-row total"><span>Total</span><strong>₹{total.toLocaleString('en-IN')}</strong></div>
+        {fulfillmentMethod === 'delivery' ? (
+          <>
+            <div className="checkout-section-heading"><span className="checkout-section-icon"><MapPin className="icon" /></span><div><h3>Delivery address</h3><p>Select one of your saved destinations.</p></div></div>
+            {addressLoading ? <p className="profile-empty-location">Loading saved addresses…</p> : addresses.length ? (
+              <div className="checkout-address-options">
+                {addresses.map((address) => (
+                  <label className={selectedAddressId === address.id ? 'checkout-address-option selected' : 'checkout-address-option'} key={address.id}>
+                    <input type="radio" name="delivery-address" value={address.id} checked={selectedAddressId === address.id} onChange={() => { setQuote(null); setSelectedAddressId(address.id) }} />
+                    <span><strong>{address.label}{address.isDefault ? ' · Default' : ''}</strong><small>{formatCustomerAddress(address)}</small>{address.contactPhone && <small>Contact: {address.contactPhone}</small>}</span>
+                  </label>
+                ))}
+              </div>
+            ) : <p className="profile-empty-location">No saved delivery address. Add one in your profile before ordering.</p>}
+            <button type="button" className="text-action" onClick={() => navigate('/profile')}>Manage saved addresses</button>
+          </>
+        ) : <p className="profile-empty-location">No delivery address is needed for pickup. The quote will verify current pickup availability.</p>}
+        <label className="checkout-discount-field">Discount code (optional)
+          <input value={discountCode} maxLength={60} autoComplete="off" placeholder="Enter a promo code" onChange={(event) => { setQuote(null); setDiscountCode(event.target.value) }} />
+        </label>
+        {restrictedItems.length > 0 && (
+          <section className="checkout-prescription-card" aria-label="Prescription approval">
+            <div className="checkout-section-heading"><span className="checkout-section-icon"><ClipboardList className="icon" /></span><div><h3>Prescription approval required</h3><p>Restricted medicines cannot be quoted or ordered until an authorized pharmacist approves a valid prescription.</p></div></div>
+            <div className="prescription-required-items">
+              {restrictedItems.map((item) => <p key={item.id}><strong>{item.name}</strong> · {item.quantity} pack(s)</p>)}
+            </div>
+            {eligiblePrescriptions.length ? (
+              <label className="checkout-discount-field">Approved prescription
+                <select value={selectedPrescription?.id ?? ''} onChange={(event) => {
+                  setQuote(null)
+                  setSelectedPrescriptionId(event.target.value ? Number(event.target.value) : null)
+                }}>
+                  <option value="">Choose an approved document</option>
+                  {eligiblePrescriptions.map((prescription) => (
+                    <option key={prescription.id} value={prescription.id}>
+                      Prescription #{prescription.id} · valid through {prescription.validUntil}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            ) : <p className="profile-empty-location">No current approved prescription covers every restricted item and requested quantity.</p>}
+            <label className="prescription-file-field">Upload prescription (PDF, JPEG, or PNG · up to 5 MB)
+              <input
+                ref={prescriptionFileInput}
+                type="file"
+                accept="application/pdf,image/jpeg,image/png"
+                onChange={(event) => {
+                  setPrescriptionFile(event.target.files?.[0] ?? null)
+                  setPrescriptionError('')
+                  setPrescriptionMessage('')
+                }}
+              />
+            </label>
+            <p className="prescription-privacy-note">Documents are malware-scanned, encrypted, and stored outside public assets. They are never exposed through a public URL. Uploads fail closed if secure storage or malware screening is unavailable.</p>
+            <button type="button" className="accept-action" disabled={!prescriptionFile || uploadingPrescription} onClick={() => void uploadPrescription()}>
+              {uploadingPrescription ? 'Scanning and securely uploading…' : 'Upload for pharmacist review'}
+            </button>
+            {prescriptionMessage && <p className="verification-success" role="status">{prescriptionMessage}</p>}
+            {prescriptionError && <p className="owner-form-error" role="alert">{prescriptionError}</p>}
+            {prescriptions.filter((prescription) => prescription.items.some((item) => requiredMedicineIds.includes(item.medicineId))).map((prescription) => (
+              <article className="prescription-history-card" key={prescription.id}>
+                <strong>Prescription #{prescription.id} · {prescription.status.replace('_', ' ')}</strong>
+                <span>Submitted {new Date(prescription.submittedAt).toLocaleDateString()}</span>
+                {prescription.reviewReason && <small>Pharmacist note: {prescription.reviewReason}</small>}
+                {!prescription.documentAvailable && <small>Document deleted under the retention policy.</small>}
+              </article>
+            ))}
+          </section>
+        )}
+        <div className="checkout-section-heading"><span className="checkout-section-icon"><PackageCheck className="icon" /></span><div><h3>Order summary</h3><p>{cart.reduce((sum, item) => sum + item.quantity, 0)} pack(s)</p></div></div>
+        {activeQuote ? (
+          <section className="checkout-quote" aria-label="Confirmed price quote">
+            <p className="checkout-quote-title">Current confirmed price · {activeQuote.pharmacyName}</p>
+            {activeQuote.items.map((item) => (
+              <div className="checkout-quote-line" key={item.medicineId}>
+                <span>
+                  <strong>{item.name} × {item.quantity} pack(s)</strong>
+                  <small>₹{item.unitPrice.toLocaleString('en-IN')} per pack · {item.availableQuantity} pack(s) currently available</small>
+                  {item.baseUnitQuantity !== null && <small>{item.baseUnitQuantity} {item.packUnit} total ({item.packQuantity} per pack)</small>}
+                  {item.prescriptionRequired && <small>Approved prescription #{item.prescriptionId} · valid through {item.prescriptionValidUntil}</small>}
+                  {item.discountAmount > 0 && <small>Discount −₹{item.discountAmount.toLocaleString('en-IN')} · tax {item.taxRate}%</small>}
+                </span>
+                <strong>₹{item.lineTotal.toLocaleString('en-IN')}</strong>
+              </div>
+            ))}
+            <div className="summary-row"><span>Subtotal</span><strong>₹{activeQuote.subtotal.toLocaleString('en-IN')}</strong></div>
+            {activeQuote.discountAmount > 0 && <div className="summary-row"><span>Discount{activeQuote.discountCode ? ` (${activeQuote.discountCode})` : ''}</span><strong>−₹{activeQuote.discountAmount.toLocaleString('en-IN')}</strong></div>}
+            <div className="summary-row"><span>Tax (pharmacy GST)</span><strong>₹{activeQuote.taxAmount.toLocaleString('en-IN')}</strong></div>
+            <div className="summary-row"><span>{activeQuote.fulfillmentMethod === 'pickup' ? 'Pickup fee' : 'Delivery fee'}</span><strong>₹{activeQuote.deliveryFee.toLocaleString('en-IN')}</strong></div>
+            <div className="summary-row total"><span>Confirmed total</span><strong>₹{activeQuote.total.toLocaleString('en-IN')}</strong></div>
+            <p className="checkout-quote-expiry">Quote expires {new Date(activeQuote.expiresAt).toLocaleTimeString()}.</p>
+          </section>
+        ) : (
+          <p className="checkout-quote-prompt">Cart prices are estimates. Request a live quote to confirm current prices, batch-backed stock, tax, discounts, and fulfillment fees.</p>
+        )}
         <div className="checkout-section-heading"><span className="checkout-section-icon"><ShoppingBag className="icon" /></span><div><h3>Payment method</h3><p>Choose how you would like to pay.</p></div></div>
         <div className="payment-stack">
           {['Cash on Delivery', 'UPI Payment'].map((option) => (
             <button
               key={option}
               className={paymentMethod === option ? 'payment-option selected' : 'payment-option'}
-              onClick={() => setPaymentMethod(option)}
+              onClick={() => { setQuote(null); setPaymentMethod(option) }}
             >
               <span>{option}</span>
               {paymentMethod === option ? <Check className="icon" /> : <span className="dot" />}
             </button>
           ))}
         </div>
+        <p className="checkout-quote-prompt">UPI remains pending until a verified payment gateway confirms payment. Choosing UPI here does not mark the order paid.</p>
         {error && <p className="owner-form-error" role="alert">{error}</p>}
-        <button className="primary-cta dark" disabled={saving || addressLoading || !deliveryAddress} onClick={() => void placeOrder()}>
-          {saving ? 'Placing order…' : 'Place order'}
+        <button
+          type="button"
+          className="primary-cta dark"
+          disabled={saving || quoteLoading || addressLoading ||
+            (fulfillmentMethod === 'delivery' && !selectedAddress) ||
+            (restrictedItems.length > 0 && !selectedPrescription)}
+          onClick={() => void (activeQuote ? placeOrder() : requestQuote())}
+        >
+          {quoteLoading ? 'Checking current prices and stock…' : saving ? 'Placing order…' : activeQuote ? 'Confirm quote and place order' : 'Get confirmed total'}
         </button>
       </div>
     </motion.div>
@@ -2013,8 +2861,8 @@ function AuthenticationPage({
 }) {
   const [searchParams] = useSearchParams()
   const requestedRole = searchParams.get('role')
-  const [role, setRole] = useState<AccountRole>(requestedRole === 'pharmacy_owner' ? 'pharmacy_owner' : 'customer')
-  const [isSignUp, setIsSignUp] = useState(searchParams.get('mode') === 'signup')
+  const [role, setRole] = useState<AccountRole>(requestedRole === 'admin' ? 'admin' : requestedRole === 'pharmacy_owner' ? 'pharmacy_owner' : 'customer')
+  const [isSignUp, setIsSignUp] = useState(searchParams.get('mode') === 'signup' && requestedRole !== 'admin')
   const [form, setForm] = useState({
     fullName: '',
     pharmacyName: '',
@@ -2140,11 +2988,16 @@ function AuthenticationPage({
             <span><strong>Pharmacy owner</strong><small>Manage your pharmacy</small></span>
             <span className="auth-role-check">{role === 'pharmacy_owner' ? <Check className="icon" /> : null}</span>
           </button>
+          <button type="button" className={role === 'admin' ? 'auth-role-card selected' : 'auth-role-card'} aria-pressed={role === 'admin'} onClick={() => { setRole('admin'); setIsSignUp(false); setRequestError('') }}>
+            <span className="auth-role-icon"><LayoutGrid className="icon" /></span>
+            <span><strong>Administrator</strong><small>View platform operations</small></span>
+            <span className="auth-role-check">{role === 'admin' ? <Check className="icon" /> : null}</span>
+          </button>
         </div>
 
         <div className="auth-mode-switch" aria-label="Sign-in method">
           <button type="button" className={!isSignUp ? 'active' : ''} aria-pressed={!isSignUp} onClick={() => setMode(false)}>Sign in</button>
-          <button type="button" className={isSignUp ? 'active' : ''} aria-pressed={isSignUp} onClick={() => setMode(true)}>Create account</button>
+          {role !== 'admin' && <button type="button" className={isSignUp ? 'active' : ''} aria-pressed={isSignUp} onClick={() => setMode(true)}>Create account</button>}
         </div>
 
         {connectionError && <p className="auth-error" role="alert">{connectionError}</p>}
@@ -2213,10 +3066,22 @@ function AuthenticationPage({
             {!busy && <ArrowUpRight className="icon" />}
           </button>
         </form>
-        <p className="auth-privacy-note">Your account opens only the {role === 'customer' ? 'customer' : 'pharmacy owner'} workspace.</p>
+        <p className="auth-privacy-note">Your account opens only the {role === 'customer' ? 'customer' : role === 'admin' ? 'administrator' : 'pharmacy owner'} workspace.</p>
       </section>
     </main>
   )
+}
+
+type AdminOverview = { accounts: Record<string, number>; pharmacies: number; deliveredOrders: number; revenue: number; lowStock: Array<{ id: number; name: string; stock: number; reorderLevel: number; pharmacyName: string }>; recentOrders: Array<{ id: number; orderNumber: string; status: string; total: number; pharmacyName: string; createdAt: string }> }
+type PendingPharmacy = { id: number; name: string; email: string | null; phone: string | null; address: string | null; city: string | null; state: string | null; drugLicenseNumber: string | null; approvalStatus: string; rejectionReason: string | null; registrationNumber: string | null; licenseNumber: string | null; authorizedPharmacistName: string | null; authorizedPharmacistRegistration: string | null; evidenceUrl: string | null; submittedAt: string | null }
+
+function AdminPage({ session, onSignOut }: { session: AccountSession; onSignOut: () => void }) {
+  const [data, setData] = useState<AdminOverview | null>(null)
+  const [pending, setPending] = useState<PendingPharmacy[]>([])
+  const [error, setError] = useState('')
+  useEffect(() => { void Promise.all([authenticatedApiFetch('/api/admin/overview', session.token), authenticatedApiFetch('/api/admin/pharmacies/pending', session.token)]).then(async ([overviewResponse, pendingResponse]) => { const result = await overviewResponse.json(); const applications = await pendingResponse.json(); if (!overviewResponse.ok) throw new Error(result.error); if (!pendingResponse.ok) throw new Error(applications.error); setData(result); setPending(applications) }).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load administration data.')) }, [session.token])
+  const decide = async (id: number, decision: 'approved' | 'rejected' | 'revoked') => { const reason = decision === 'approved' ? '' : window.prompt(`Reason for ${decision}:`) || ''; if (decision !== 'approved' && !reason) return; const response = await authenticatedApiFetch(`/api/admin/pharmacies/${id}/decision`, session.token, { method: 'POST', body: JSON.stringify({ decision, reason }) }); if (!response.ok) { const result = await response.json(); setError(result.error || 'Decision failed.'); return }; setPending((items) => items.filter((item) => item.id !== id)) }
+  return <main className="admin-page"><header className="admin-header"><div><div className="brand-mark">P+</div><h1>Administration</h1><p>Platform-wide pharmacy operations</p></div><button className="quiet-action" onClick={onSignOut}><LogOut className="icon" /> Sign out</button></header>{error && <p className="auth-error">{error}</p>}{!data ? <p>Loading dashboard…</p> : <><section className="admin-stats"><article><span>Customers</span><strong>{data.accounts.customer || 0}</strong></article><article><span>Pharmacy owners</span><strong>{data.accounts.pharmacy_owner || 0}</strong></article><article><span>Pharmacies</span><strong>{data.pharmacies}</strong></article><article><span>Delivered revenue</span><strong>₹{data.revenue.toFixed(2)}</strong></article></section><section className="admin-review-panel"><h2>Pharmacy applications</h2>{pending.length ? pending.map((item) => <article className="admin-application" key={item.id}><div><h3>{item.name}</h3><p>{item.city || 'Location pending'} · status: <strong>{item.approvalStatus}</strong></p><p>Registration: {item.registrationNumber || '—'} · License: {item.licenseNumber || item.drugLicenseNumber || '—'}</p><p>Authorized pharmacist: {item.authorizedPharmacistName || '—'} ({item.authorizedPharmacistRegistration || '—'})</p>{item.evidenceUrl && <a href={item.evidenceUrl} target="_blank" rel="noreferrer">Open evidence link</a>}{item.rejectionReason && <p className="owner-form-error">Reason: {item.rejectionReason}</p>}</div><div className="admin-application-actions"><button className="primary-cta dark" onClick={() => void decide(item.id, 'approved')}>Approve</button><button className="quiet-action danger-action" onClick={() => void decide(item.id, 'rejected')}>Reject</button><button className="quiet-action" onClick={() => void decide(item.id, 'revoked')}>Revoke</button></div></article>) : <p>No pending pharmacy applications.</p>}</section><section className="admin-grid"><article><h2>Low-stock inventory</h2>{data.lowStock.length ? data.lowStock.map((item) => <p key={item.id}><strong>{item.name}</strong> — {item.stock}/{item.reorderLevel} · {item.pharmacyName}</p>) : <p>All active inventory is above its reorder level.</p>}</article><article><h2>Recent orders</h2>{data.recentOrders.map((order) => <p key={order.id}><strong>{order.orderNumber}</strong> — {order.status} · ₹{order.total.toFixed(2)}</p>)}</article></section></>}</main>
 }
 
 function DashboardPage({
@@ -2238,8 +3103,10 @@ function DashboardPage({
   const sectionTitles: Record<string, string> = {
     home: `Welcome, ${ownerSession.user.fullName}`,
     orders: 'Orders',
+    prescriptions: 'Prescription review',
     medicines: 'Medicines',
     delivery: 'Delivery',
+    verification: 'Pharmacy verification',
   }
 
   return (
@@ -2296,12 +3163,117 @@ function DashboardPage({
             />
           )}
 
-          {(activeSection === 'orders' || activeSection === 'delivery') && <PharmacyOrdersScreen token={ownerSession.token} orderId={orderId} />}
+          {activeSection === 'orders' && <PharmacyOrdersScreen token={ownerSession.token} orderId={orderId} />}
+          {activeSection === 'prescriptions' && <PharmacyPrescriptionScreen token={ownerSession.token} />}
+          {activeSection === 'delivery' && (
+            <>
+              <MarketplaceSettingsScreen token={ownerSession.token} />
+              <PharmacyOrdersScreen token={ownerSession.token} orderId={orderId} />
+            </>
+          )}
           {activeSection === 'medicines' && <PharmacyMedicinesScreen onCatalogChange={onCatalogChange} token={ownerSession.token} />}
+          {activeSection === 'verification' && <PharmacyVerificationScreen token={ownerSession.token} />}
         </main>
       </div>
     </motion.div>
   )
+}
+
+function MarketplaceSettingsScreen({ token }: { token: string }) {
+  const [form, setForm] = useState({ latitude: '', longitude: '', deliveryFee: '', pickupAvailable: true })
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
+  const [message, setMessage] = useState('')
+
+  useEffect(() => {
+    let cancelled = false
+    const loadSettings = async () => {
+      try {
+        const response = await ownerApiFetch('/api/owner/marketplace-settings', token)
+        const result = await response.json()
+        if (!response.ok) throw new Error(result.error || 'Could not load marketplace settings.')
+        if (!cancelled) setForm({
+          latitude: result.latitude === null ? '' : String(result.latitude),
+          longitude: result.longitude === null ? '' : String(result.longitude),
+          deliveryFee: result.deliveryFee === '' ? '' : String(result.deliveryFee),
+          pickupAvailable: result.pickupAvailable,
+        })
+      } catch (requestError) {
+        if (!cancelled) setError(requestError instanceof Error ? requestError.message : 'Could not load marketplace settings.')
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    }
+    void loadSettings()
+    return () => { cancelled = true }
+  }, [token])
+
+  const saveSettings = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    setSaving(true)
+    setError('')
+    setMessage('')
+    try {
+      const response = await ownerApiFetch('/api/owner/marketplace-settings', token, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          latitude: form.latitude.trim() ? Number(form.latitude) : null,
+          longitude: form.longitude.trim() ? Number(form.longitude) : null,
+          deliveryFee: form.deliveryFee.trim() ? Number(form.deliveryFee) : null,
+          pickupAvailable: form.pickupAvailable,
+        }),
+      })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.error || 'Could not save marketplace settings.')
+      setMessage('Marketplace information saved. Customers will see your pickup, fee, and approximate distance details.')
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Could not save marketplace settings.')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <section className="marketplace-settings-panel">
+      <div className="pharmacy-page-heading">
+        <div><h3>Marketplace listing details</h3><p>Set disclosed delivery fees, pickup availability, and optional coordinates for approximate distance.</p></div>
+      </div>
+      {error && <p className="owner-form-error" role="alert">{error}</p>}
+      {message && <p className="verification-success" role="status">{message}</p>}
+      {loading ? <p className="inventory-note">Loading marketplace settings…</p> : (
+        <form className="marketplace-settings-form" onSubmit={(event) => void saveSettings(event)}>
+          <label>Delivery fee (₹)
+            <input type="number" min="0" max="100000" step="0.01" placeholder="Leave blank if not disclosed" value={form.deliveryFee} onChange={(event) => setForm((current) => ({ ...current, deliveryFee: event.target.value }))} />
+          </label>
+          <label className="marketplace-pickup-toggle">
+            <input type="checkbox" checked={form.pickupAvailable} onChange={(event) => setForm((current) => ({ ...current, pickupAvailable: event.target.checked }))} />
+            <span>Customers can pick up orders from this pharmacy</span>
+          </label>
+          <div className="marketplace-coordinate-note">Coordinates are used only for approximate straight-line distance; no reverse geocoding is performed.</div>
+          <label>Latitude
+            <input type="number" min="-90" max="90" step="any" placeholder="Optional" value={form.latitude} onChange={(event) => setForm((current) => ({ ...current, latitude: event.target.value }))} />
+          </label>
+          <label>Longitude
+            <input type="number" min="-180" max="180" step="any" placeholder="Optional" value={form.longitude} onChange={(event) => setForm((current) => ({ ...current, longitude: event.target.value }))} />
+          </label>
+          <button type="submit" className="accept-action" disabled={saving}>{saving ? 'Saving…' : 'Save marketplace details'}</button>
+        </form>
+      )}
+    </section>
+  )
+}
+
+function PharmacyVerificationScreen({ token }: { token: string }) {
+  const [form, setForm] = useState({ registrationNumber: '', licenseNumber: '', authorizedPharmacistName: '', authorizedPharmacistRegistration: '', evidenceUrl: '' })
+  const [message, setMessage] = useState('')
+  const [error, setError] = useState('')
+  const submit = async (event: FormEvent) => {
+    event.preventDefault(); setMessage(''); setError('')
+    try { const response = await ownerApiFetch('/api/owner/pharmacy/onboard', token, { method: 'POST', body: JSON.stringify(form) }); const result = await response.json(); if (!response.ok) throw new Error(result.error); setMessage(`Application submitted on ${new Date(result.submittedAt).toLocaleString()}. An administrator will review your evidence.`) } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not submit verification.') }
+  }
+  return <section className="verification-panel"><div className="pharmacy-page-heading"><div><h3>Submit pharmacy verification</h3><p>Provide registration and pharmacist evidence. Marketplace access stays disabled until approval. Prescription review is available only when this owner account name exactly matches the approved authorized pharmacist name.</p></div></div>{message && <p className="verification-success">{message}</p>}{error && <p className="owner-form-error">{error}</p>}<form className="verification-form" onSubmit={submit}>{[['registrationNumber','Pharmacy registration number'],['licenseNumber','Drug license number'],['authorizedPharmacistName','Authorized pharmacist name'],['authorizedPharmacistRegistration','Pharmacist registration number'],['evidenceUrl','Evidence link (secure document URL)']].map(([key,label]) => <label key={key}>{label}<input required value={form[key as keyof typeof form]} onChange={(event) => setForm({ ...form, [key]: event.target.value })} placeholder={label} /></label>)}<button className="primary-cta dark" type="submit">Submit for admin review <ArrowUpRight className="icon" /></button></form></section>
 }
 
 function PharmacyOverviewScreen({
@@ -2557,8 +3529,8 @@ function PharmacyOrdersScreen({ token, orderId }: { token: string; orderId?: str
             {!orderId && <button type="button" className="fulfillment-open-button" onClick={() => navigate(`/dashboard/orders/${order.id}`)}>Open fulfillment <ArrowUpRight className="icon" /></button>}
             <p className="owner-order-meta">Placed {new Date(order.createdAt).toLocaleString()} · ₹{order.total.toLocaleString('en-IN')}</p>
             <p className="owner-order-customer">{order.customerName || 'Customer'}{order.customerPhone ? ` · ${order.customerPhone}` : ''}</p>
-            <div className="owner-order-items">{order.items.map((item) => <div key={`${order.id}-${item.medicineId}`}><span>{item.name} × {item.quantity}</span><strong>₹{item.lineTotal.toLocaleString('en-IN')}</strong></div>)}</div>
-            <p className="customer-order-address"><MapPin className="icon" /> {order.deliveryAddress}</p>
+            <div className="owner-order-items">{order.items.map((item) => <div key={`${order.id}-${item.medicineId}`}><span>{item.name} × {formatOrderItemQuantity(item)}{item.prescriptionRequired && <small> · Prescription #{item.prescriptionId} approved</small>}</span><strong>₹{item.lineTotal.toLocaleString('en-IN')}</strong></div>)}</div>
+            <p className="customer-order-address"><MapPin className="icon" /> {order.fulfillmentMethod === 'pickup' ? 'Pharmacy pickup' : formatOrderLocation(order)}</p>
             <OrderTimeline order={order} />
             {order.status === 'pending' && <div className="owner-order-actions"><button type="button" className="decline-action" disabled={savingId === order.id} onClick={() => void updateStatus(order, 'declined')}>Decline</button><button type="button" className="accept-action" disabled={savingId === order.id} onClick={() => void updateStatus(order, 'accepted')}>{savingId === order.id ? 'Saving…' : 'Accept order'}</button></div>}
             {order.status === 'accepted' && <button type="button" className="accept-action owner-order-primary" disabled={savingId === order.id} onClick={() => void updateStatus(order, 'preparing')}>{savingId === order.id ? 'Saving…' : 'Mark packed'}</button>}
@@ -2568,6 +3540,211 @@ function PharmacyOrdersScreen({ token, orderId }: { token: string; orderId?: str
         ))}</div>
       ) : <div className="empty-state-card orders-empty-state"><span className="empty-state-icon-wrap"><ShoppingBag className="icon" /></span><h2>{orderId ? 'Order not found' : 'No orders yet'}</h2><p>{orderId ? 'This order is not part of your pharmacy account.' : 'New customer orders will appear here and update automatically.'}</p></div>}
     </section>
+  )
+}
+
+function PharmacyPrescriptionScreen({ token }: { token: string }) {
+  const [prescriptions, setPrescriptions] = useState<PrescriptionRecord[]>([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+
+  const loadPrescriptions = useCallback(async () => {
+    try {
+      const response = await ownerApiFetch('/api/owner/prescriptions', token)
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.error || 'Could not load prescription reviews.')
+      setPrescriptions(result as PrescriptionRecord[])
+      setError('')
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Could not load prescription reviews.')
+    } finally {
+      setLoading(false)
+    }
+  }, [token])
+
+  useEffect(() => {
+    // Keep new prescription submissions visible without exposing public file links.
+    // oxlint-disable-next-line react/set-state-in-effect
+    void loadPrescriptions()
+    const timer = window.setInterval(() => void loadPrescriptions(), 15000)
+    return () => window.clearInterval(timer)
+  }, [loadPrescriptions])
+
+  const review = async (id: number, decision: string, values: Record<string, unknown>) => {
+    const response = await ownerApiFetch(`/api/owner/prescriptions/${id}/review`, token, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...values, decision }),
+    })
+    const result = await response.json()
+    if (!response.ok) throw new Error(result.error || 'Could not save this prescription decision.')
+    await loadPrescriptions()
+  }
+
+  return (
+    <section className="pharmacy-page-content">
+      <div className="pharmacy-page-heading">
+        <div><h3>Prescription verification queue</h3><p>Confirm patient and prescriber identity, each requested medicine and quantity, document dates, and applicable legal requirements before approval.</p></div>
+        <span className="count-badge">{prescriptions.filter((item) => item.status === 'pending' || item.status === 'correction_required').length} awaiting review</span>
+      </div>
+      <p className="prescription-privacy-note">Only the pharmacist named in this pharmacy’s approved verification can open documents or submit a decision. Files are downloaded through authenticated, no-cache endpoints.</p>
+      {error && <p className="owner-form-error" role="alert">{error}</p>}
+      {loading ? <div className="empty-state-card compact-empty">Loading prescription reviews…</div> : prescriptions.length ? (
+        <div className="prescription-review-list">
+          {prescriptions.map((prescription) => (
+            <PrescriptionReviewCard key={prescription.id} prescription={prescription} token={token} onReview={review} />
+          ))}
+        </div>
+      ) : <div className="empty-state-card compact-empty">No prescriptions are waiting for your pharmacy.</div>}
+    </section>
+  )
+}
+
+function PrescriptionReviewCard({
+  prescription,
+  token,
+  onReview,
+}: {
+  prescription: PrescriptionRecord
+  token: string
+  onReview: (id: number, decision: string, values: Record<string, unknown>) => Promise<void>
+}) {
+  const [prescriptionDate, setPrescriptionDate] = useState('')
+  const [validUntil, setValidUntil] = useState('')
+  const [reason, setReason] = useState('')
+  const [patientMatches, setPatientMatches] = useState(false)
+  const [prescriberValid, setPrescriberValid] = useState(false)
+  const [legalRequirementsSatisfied, setLegalRequirementsSatisfied] = useState(false)
+  const [medicineMatches, setMedicineMatches] = useState<Record<number, boolean>>({})
+  const [approvedQuantities, setApprovedQuantities] = useState<Record<number, string>>({})
+  const [saving, setSaving] = useState(false)
+  const [downloading, setDownloading] = useState(false)
+  const [error, setError] = useState('')
+  const [message, setMessage] = useState('')
+  const approvalReady = prescription.documentAvailable &&
+    reason.trim().length >= 3 &&
+    prescriptionDate.length > 0 &&
+    validUntil.length > 0 &&
+    patientMatches &&
+    prescriberValid &&
+    legalRequirementsSatisfied &&
+    prescription.items.every((item) =>
+      medicineMatches[item.medicineId] === true &&
+      Number.isSafeInteger(Number(approvedQuantities[item.medicineId] ?? item.requestedQuantity)) &&
+      Number(approvedQuantities[item.medicineId] ?? item.requestedQuantity) >= item.requestedQuantity &&
+      Number(approvedQuantities[item.medicineId] ?? item.requestedQuantity) <= 10000,
+    )
+
+  const downloadDocument = async () => {
+    setDownloading(true)
+    setError('')
+    try {
+      const response = await ownerApiFetch(`/api/owner/prescriptions/${prescription.id}/file`, token)
+      if (!response.ok) {
+        const result = await response.json()
+        throw new Error(result.error || 'Could not download the prescription document.')
+      }
+      const blobUrl = URL.createObjectURL(await response.blob())
+      const link = document.createElement('a')
+      link.href = blobUrl
+      link.download = `prescription-${prescription.id}`
+      link.click()
+      window.setTimeout(() => URL.revokeObjectURL(blobUrl), 1000)
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Could not download the prescription document.')
+    } finally {
+      setDownloading(false)
+    }
+  }
+
+  const submitReview = async (decision: 'approved' | 'rejected' | 'correction_requested') => {
+    setSaving(true)
+    setError('')
+    setMessage('')
+    try {
+      const items = prescription.items.map((item) => ({
+        medicineId: item.medicineId,
+        medicineMatches: medicineMatches[item.medicineId] === true,
+        approvedQuantity: Number(approvedQuantities[item.medicineId] ?? item.requestedQuantity),
+      }))
+      await onReview(prescription.id, decision, {
+        reason,
+        prescriptionDate,
+        validUntil,
+        patientMatches,
+        prescriberValid,
+        legalRequirementsSatisfied,
+        items,
+      })
+      setMessage(decision === 'approved' ? 'Prescription approved for the recorded quantities.' : `Prescription ${decision === 'rejected' ? 'rejected' : 'returned for correction'}.`)
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Could not save this prescription decision.')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <article className="prescription-review-card">
+      <header>
+        <div><strong>Prescription #{prescription.id}</strong><span>Customer: {prescription.customerName || 'Customer'} · submitted {new Date(prescription.submittedAt).toLocaleString()}</span></div>
+        <span className={`order-status-pill ${prescription.status}`}>{prescription.status.replace('_', ' ')}</span>
+      </header>
+      {prescription.validUntil && <p>Valid through {prescription.validUntil}</p>}
+      {prescription.reviewReason && <p className="prescription-review-note">Previous decision: {prescription.reviewReason}</p>}
+      {prescription.documentAvailable ? (
+        <button type="button" className="quiet-action" disabled={downloading} onClick={() => void downloadDocument()}>
+          {downloading ? 'Retrieving securely…' : 'Download document securely'}
+        </button>
+      ) : <p className="owner-form-error">The private document has been deleted under the retention policy.</p>}
+      {prescription.status !== 'approved' && prescription.documentAvailable && (
+        <>
+          <div className="prescription-requested-items">
+            {prescription.items.map((item) => (
+              <div className="prescription-requested-item" key={item.medicineId}>
+                <strong>{item.name} · requested {item.requestedQuantity} pack(s)</strong>
+                <label className="prescription-review-check">
+                  <input type="checkbox" checked={medicineMatches[item.medicineId] ?? false} onChange={(event) => setMedicineMatches((current) => ({ ...current, [item.medicineId]: event.target.checked }))} />
+                  <span>Medicine matches the prescription</span>
+                </label>
+                <label>Approved quantity (packs)
+                  <input type="number" min={item.requestedQuantity} max="10000" value={approvedQuantities[item.medicineId] ?? String(item.requestedQuantity)} onChange={(event) => setApprovedQuantities((current) => ({ ...current, [item.medicineId]: event.target.value }))} />
+                </label>
+              </div>
+            ))}
+          </div>
+          <div className="prescription-review-checks">
+            <label className="prescription-review-check"><input type="checkbox" checked={patientMatches} onChange={(event) => setPatientMatches(event.target.checked)} /><span>Patient identity matches the customer</span></label>
+            <label className="prescription-review-check"><input type="checkbox" checked={prescriberValid} onChange={(event) => setPrescriberValid(event.target.checked)} /><span>Prescriber is valid</span></label>
+            <label className="prescription-review-check"><input type="checkbox" checked={legalRequirementsSatisfied} onChange={(event) => setLegalRequirementsSatisfied(event.target.checked)} /><span>Applicable legal requirements are satisfied</span></label>
+          </div>
+          <div className="prescription-review-dates">
+            <label>Prescription date<input type="date" value={prescriptionDate} onChange={(event) => setPrescriptionDate(event.target.value)} /></label>
+            <label>Valid through<input type="date" value={validUntil} onChange={(event) => setValidUntil(event.target.value)} /></label>
+          </div>
+          <label className="prescription-review-reason">Decision reason / customer instructions
+            <textarea rows={3} maxLength={1000} value={reason} onChange={(event) => setReason(event.target.value)} />
+            <small>A concise reason is retained with the review. Avoid unrelated health details.</small>
+          </label>
+          <div className="prescription-review-actions">
+            <button type="button" className="accept-action" disabled={saving || !approvalReady} onClick={() => void submitReview('approved')}>{saving ? 'Saving…' : 'Approve'}</button>
+            <button type="button" className="quiet-action" disabled={saving || reason.trim().length < 3} onClick={() => void submitReview('correction_requested')}>Request correction</button>
+            <button type="button" className="decline-action" disabled={saving || reason.trim().length < 3} onClick={() => void submitReview('rejected')}>Reject</button>
+          </div>
+        </>
+      )}
+      {prescription.status === 'approved' && (
+        <>
+          <label className="prescription-review-reason">Reason for revoking approval
+            <textarea rows={2} maxLength={1000} value={reason} onChange={(event) => setReason(event.target.value)} />
+          </label>
+          <button type="button" className="decline-action" disabled={saving || reason.trim().length < 3} onClick={() => void submitReview('rejected')}>Revoke approval</button>
+        </>
+      )}
+      {error && <p className="owner-form-error" role="alert">{error}</p>}
+      {message && <p className="verification-success" role="status">{message}</p>}
+      <small>Document retention ends {prescription.retentionUntil}; the file is automatically deleted after that date.</small>
+    </article>
   )
 }
 
@@ -2613,8 +3790,13 @@ function PharmacyMedicinesScreen({ onCatalogChange, token }: { onCatalogChange: 
     setStepError('')
     setForm({
       name: item.name,
+      brandName: item.brandName ?? '',
       category: item.category,
       pack: item.pack,
+      strength: item.strength ?? '',
+      dosageForm: item.dosageForm ?? '',
+      packQuantity: item.packQuantity === null ? '' : String(item.packQuantity),
+      packUnit: item.packUnit ?? '',
       price: String(item.price),
       stock: String(item.stock),
       reorderLevel: String(item.reorderLevel),
@@ -2634,8 +3816,14 @@ function PharmacyMedicinesScreen({ onCatalogChange, token }: { onCatalogChange: 
   const saveMedicine = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (!form) return
-    if (!form.name.trim() || !form.category.trim() || !form.pack.trim()) {
-      setStepError('Add the medicine name, category, and pack size before saving.')
+    if (!form.name.trim() || !form.category.trim() || !form.pack.trim() || !form.brandName.trim()
+      || !form.genericName.trim() || !form.strength.trim() || !form.dosageForm.trim()
+      || !form.packQuantity.trim() || !form.packUnit.trim()) {
+      setStepError('Complete the brand, generic ingredient, strength, dosage form, and pack dimensions to support safe exact-product matching.')
+      return
+    }
+    if (!Number.isSafeInteger(Number(form.packQuantity)) || Number(form.packQuantity) < 1) {
+      setStepError('Pack quantity must be a positive whole number.')
       return
     }
     if ([form.price, form.stock, form.reorderLevel].some((value) =>
@@ -2652,6 +3840,7 @@ function PharmacyMedicinesScreen({ onCatalogChange, token }: { onCatalogChange: 
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           ...form,
+          packQuantity: Number(form.packQuantity),
           price: Number(form.price),
           stock: Number(form.stock),
           reorderLevel: Number(form.reorderLevel),
@@ -2718,7 +3907,7 @@ function PharmacyMedicinesScreen({ onCatalogChange, token }: { onCatalogChange: 
   const inventoryCategories = ['All categories', ...new Set(inventory.map((item) => item.category).sort())]
   const visibleInventory = inventory.filter((item) => {
     const matchesCategory = inventoryCategory === 'All categories' || item.category === inventoryCategory
-    const matchesSearch = !inventorySearch.trim() || `${item.name} ${item.genericName ?? ''} ${item.sku ?? ''} ${item.batchNumber ?? ''} ${item.manufacturer ?? ''}`.toLowerCase().includes(inventorySearch.trim().toLowerCase())
+    const matchesSearch = !inventorySearch.trim() || `${item.name} ${item.brandName ?? ''} ${item.genericName ?? ''} ${item.strength ?? ''} ${item.dosageForm ?? ''} ${item.sku ?? ''} ${item.batchNumber ?? ''} ${item.manufacturer ?? ''}`.toLowerCase().includes(inventorySearch.trim().toLowerCase())
     return matchesCategory && matchesSearch
   })
 
@@ -2748,8 +3937,15 @@ function PharmacyMedicinesScreen({ onCatalogChange, token }: { onCatalogChange: 
             <form className="medicine-editor-form" onSubmit={saveMedicine}>
               <div className="medicine-editor-step-heading"><span>PRODUCT CATALOG</span><h4>Medicine information</h4></div>
               {stepError && <p className="medicine-editor-error" role="alert">{stepError}</p>}
+              <p className="inventory-note">Exact-match listings require the same brand, generic ingredient, strength, dosage form, and pack dimensions. Enter these from the product packaging.</p>
               <div className="medicine-editor-fields">
                 <label className="medicine-field-wide">Medicine name<input autoFocus required placeholder="e.g. Paracetamol 500 mg" value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} /></label>
+                <label>Brand<input required placeholder="Brand as printed on pack" value={form.brandName} onChange={(event) => setForm({ ...form, brandName: event.target.value })} /></label>
+                <label>Generic ingredient<input required placeholder="Active ingredient(s)" value={form.genericName} onChange={(event) => setForm({ ...form, genericName: event.target.value })} /></label>
+                <label>Strength<input required placeholder="e.g. 500 mg" value={form.strength} onChange={(event) => setForm({ ...form, strength: event.target.value })} /></label>
+                <label>Dosage form<input required placeholder="e.g. tablet, capsule, syrup" value={form.dosageForm} onChange={(event) => setForm({ ...form, dosageForm: event.target.value })} /></label>
+                <label>Pack quantity<input required type="number" min="1" step="1" placeholder="e.g. 10" value={form.packQuantity} onChange={(event) => setForm({ ...form, packQuantity: event.target.value })} /></label>
+                <label>Pack unit<input required placeholder="e.g. tablets, capsules, mL" value={form.packUnit} onChange={(event) => setForm({ ...form, packUnit: event.target.value })} /></label>
                 <label>Category<input required list="medicine-category-options" placeholder="Choose or type a category" value={form.category} onChange={(event) => setForm({ ...form, category: event.target.value })} /><datalist id="medicine-category-options">{categories.map((category) => <option key={category.name} value={category.name} />)}</datalist></label>
                 <label>Pack size<input required placeholder="e.g. 10 tablets" value={form.pack} onChange={(event) => setForm({ ...form, pack: event.target.value })} /></label>
                 <label>Sale price (₹)<input required type="number" min="0" step="0.01" placeholder="0.00" value={form.price} onChange={(event) => setForm({ ...form, price: event.target.value })} /></label>
@@ -2757,7 +3953,6 @@ function PharmacyMedicinesScreen({ onCatalogChange, token }: { onCatalogChange: 
                 <label>Low-stock alert<input required type="number" min="0" step="1" placeholder="0" value={form.reorderLevel} onChange={(event) => setForm({ ...form, reorderLevel: event.target.value })} /></label>
                 <label>Expiry date<input type="date" value={form.expiry} onChange={(event) => setForm({ ...form, expiry: event.target.value })} /></label>
                 <label>SKU / barcode<input placeholder="Optional" value={form.sku} onChange={(event) => setForm({ ...form, sku: event.target.value })} /></label>
-                <label>Generic name<input placeholder="Optional" value={form.genericName} onChange={(event) => setForm({ ...form, genericName: event.target.value })} /></label>
                 <label>Manufacturer<input placeholder="Optional" value={form.manufacturer} onChange={(event) => setForm({ ...form, manufacturer: event.target.value })} /></label>
                 <label>Batch number<input placeholder="Optional" value={form.batchNumber} onChange={(event) => setForm({ ...form, batchNumber: event.target.value })} /></label>
                 <label>GST rate (%)<input type="number" min="0" max="100" step="0.01" value={form.gstRate} onChange={(event) => setForm({ ...form, gstRate: event.target.value })} /></label>
