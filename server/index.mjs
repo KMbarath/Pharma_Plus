@@ -45,6 +45,23 @@ const prescriptionUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024, files: 1, fields: 2, parts: 3, fieldSize: 8192 },
 })
+const upiQrUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 1024 * 1024, files: 1, fields: 0, parts: 1 },
+})
+
+function parseUpiQrUpload(request, response, next) {
+  upiQrUpload.single('file')(request, response, (error) => {
+    if (error instanceof multer.MulterError) {
+      const tooLarge = error.code === 'LIMIT_FILE_SIZE'
+      return response.status(tooLarge ? 413 : 400).json({
+        error: tooLarge ? 'UPI QR images must be 1 MB or smaller.' : 'Upload one UPI QR image.',
+      })
+    }
+    if (error) return next(error)
+    next()
+  })
+}
 
 app.use(cors({
   origin(origin, callback) {
@@ -229,6 +246,19 @@ function validatePrescriptionFile(file) {
   if (file.mimetype === 'image/jpeg' &&
       file.buffer.length >= 3 && file.buffer[0] === 0xff && file.buffer[1] === 0xd8 && file.buffer[2] === 0xff) return null
   return 'Use a valid PDF, JPEG, or PNG prescription document.'
+}
+
+function validateUpiQrFile(file) {
+  if (!file || !Buffer.isBuffer(file.buffer) || file.buffer.length === 0) {
+    return 'Choose a UPI QR image to upload.'
+  }
+  if (file.mimetype === 'image/png' &&
+      file.buffer.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) return null
+  if (file.mimetype === 'image/jpeg' &&
+      file.buffer.length >= 3 && file.buffer[0] === 0xff && file.buffer[1] === 0xd8 && file.buffer[2] === 0xff) return null
+  if (file.mimetype === 'image/webp' && file.buffer.subarray(0, 4).toString('ascii') === 'RIFF' &&
+      file.buffer.subarray(8, 12).toString('ascii') === 'WEBP') return null
+  return 'Use a valid PNG, JPEG, or WebP UPI QR image.'
 }
 
 function scanPrescriptionBuffer(buffer) {
@@ -983,6 +1013,7 @@ function publicMarketplaceSettings(row, originLatitude = null, originLongitude =
     state: row.state,
     pickupAvailable: settings.pickupAvailable !== false,
     deliveryFee,
+    upiQrAvailable: Boolean(row.upi_qr_available),
     distanceKm: pharmacyDistanceKm(originLatitude, originLongitude, row.latitude, row.longitude),
   }
 }
@@ -999,7 +1030,8 @@ app.get('/api/pharmacies/:id', async (request, response, next) => {
   try {
     const result = await pool.query(
       `SELECT p.id::int AS id, p.name, p.phone, p.address, p.city, p.state,
-        p.latitude, p.longitude, ps.setting_value
+        p.latitude, p.longitude, ps.setting_value,
+        EXISTS (SELECT 1 FROM pharmacy_upi_qr_codes q WHERE q.pharmacy_id = p.id) AS upi_qr_available
        FROM pharmacies p
        LEFT JOIN pharmacy_settings ps ON ps.setting_key = 'marketplace:' || p.id::text
        WHERE p.id = $1 AND p.approval_status = 'approved'`,
@@ -1012,10 +1044,35 @@ app.get('/api/pharmacies/:id', async (request, response, next) => {
   }
 })
 
+app.get('/api/pharmacies/:id/upi-qr', async (request, response, next) => {
+  const id = Number(request.params.id)
+  if (!Number.isSafeInteger(id) || id < 1) return response.status(400).json({ error: 'Invalid pharmacy ID.' })
+  try {
+    const result = await pool.query(
+      `SELECT q.mime_type, q.image_data
+       FROM pharmacy_upi_qr_codes q
+       JOIN pharmacies p ON p.id = q.pharmacy_id
+       WHERE p.id = $1 AND p.approval_status = 'approved'`,
+      [id],
+    )
+    if (!result.rowCount) return response.status(404).json({ error: 'This pharmacy has not configured a UPI QR code.' })
+    response.set({
+      'Content-Type': result.rows[0].mime_type,
+      'Content-Length': result.rows[0].image_data.length,
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+    })
+    response.send(result.rows[0].image_data)
+  } catch (error) {
+    next(error)
+  }
+})
+
 app.get('/api/owner/marketplace-settings', requireOwner, async (request, response, next) => {
   try {
     const result = await pool.query(
-      `SELECT p.latitude, p.longitude, ps.setting_value
+      `SELECT p.latitude, p.longitude, ps.setting_value,
+        EXISTS (SELECT 1 FROM pharmacy_upi_qr_codes q WHERE q.pharmacy_id = p.id) AS upi_qr_available
        FROM pharmacies p
        LEFT JOIN pharmacy_settings ps ON ps.setting_key = 'marketplace:' || p.id::text
        WHERE p.id = $1`,
@@ -1031,6 +1088,7 @@ app.get('/api/owner/marketplace-settings', requireOwner, async (request, respons
       deliveryFee: Number.isFinite(Number(settings.deliveryFee)) && settings.deliveryFee !== null
         ? Number(settings.deliveryFee)
         : '',
+      upiQrAvailable: row.upi_qr_available,
     })
   } catch (error) {
     next(error)
@@ -1083,6 +1141,35 @@ app.put('/api/owner/marketplace-settings', requireOwner, async (request, respons
     next(error)
   } finally {
     client.release()
+  }
+})
+
+app.post('/api/owner/marketplace-settings/upi-qr', requireOwner, parseUpiQrUpload, async (request, response, next) => {
+  const fileError = validateUpiQrFile(request.file)
+  if (fileError) return response.status(400).json({ error: fileError })
+  try {
+    await pool.query(
+      `INSERT INTO pharmacy_upi_qr_codes (pharmacy_id, mime_type, image_data, updated_at)
+       VALUES ($1, $2, $3, now())
+       ON CONFLICT (pharmacy_id) DO UPDATE
+       SET mime_type = EXCLUDED.mime_type, image_data = EXCLUDED.image_data, updated_at = now()`,
+      [request.user.pharmacyId, request.file.mimetype, request.file.buffer],
+    )
+    response.json({ upiQrAvailable: true })
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.delete('/api/owner/marketplace-settings/upi-qr', requireOwner, async (request, response, next) => {
+  try {
+    await pool.query(
+      'DELETE FROM pharmacy_upi_qr_codes WHERE pharmacy_id = $1',
+      [request.user.pharmacyId],
+    )
+    response.status(204).end()
+  } catch (error) {
+    next(error)
   }
 })
 

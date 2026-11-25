@@ -2440,8 +2440,12 @@ function CheckoutPage({
   const [prescriptionError, setPrescriptionError] = useState('')
   const [prescriptionMessage, setPrescriptionMessage] = useState('')
   const [uploadingPrescription, setUploadingPrescription] = useState(false)
+  const [upiQrImageUrl, setUpiQrImageUrl] = useState('')
+  const [upiQrStatus, setUpiQrStatus] = useState<'idle' | 'loading' | 'ready' | 'missing' | 'error'>('idle')
+  const [upiQrError, setUpiQrError] = useState('')
   const prescriptionFileInput = useRef<HTMLInputElement>(null)
   const [today] = useState(() => new Date().toISOString().slice(0, 10))
+  const upiQrPharmacyId = cart[0]?.pharmacy_id ?? null
   const selectedAddress = addresses.find((address) => address.id === selectedAddressId) ?? null
   const restrictedItems = cart.filter((item) => item.prescriptionRequired)
   const requiredMedicineIds = restrictedItems.map((item) => item.id)
@@ -2512,6 +2516,49 @@ function CheckoutPage({
     void load()
     return () => { cancelled = true }
   }, [loadPrescriptions])
+
+  useEffect(() => {
+    if (paymentMethod !== 'UPI Payment' || upiQrPharmacyId === null) return
+    let cancelled = false
+    let objectUrl: string | null = null
+    const loadUpiQr = async () => {
+      setUpiQrImageUrl('')
+      setUpiQrError('')
+      setUpiQrStatus('loading')
+      try {
+        const response = await fetch(apiUrl(`/api/pharmacies/${upiQrPharmacyId}/upi-qr`))
+        if (response.status === 404) {
+          if (!cancelled) {
+            setUpiQrStatus('missing')
+            setUpiQrError('This pharmacy has not added a UPI QR code. Choose Cash on Delivery or contact the pharmacy.')
+          }
+          return
+        }
+        if (!response.ok) throw new Error('Could not load this pharmacy’s UPI QR code.')
+        const image = await response.blob()
+        if (!image.type.startsWith('image/')) throw new Error('The saved UPI QR is not a valid image.')
+        objectUrl = URL.createObjectURL(image)
+        if (cancelled) {
+          URL.revokeObjectURL(objectUrl)
+          return
+        }
+        setUpiQrImageUrl(objectUrl)
+        setUpiQrStatus('ready')
+      } catch (requestError) {
+        if (!cancelled) {
+          setUpiQrStatus('error')
+          setUpiQrError(requestError instanceof Error ? requestError.message : 'Could not load this pharmacy’s UPI QR code.')
+        }
+      }
+    }
+    // Load only the QR belonging to the pharmacy represented by this single-pharmacy cart.
+    // oxlint-disable-next-line react/set-state-in-effect
+    void loadUpiQr()
+    return () => {
+      cancelled = true
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
+    }
+  }, [paymentMethod, upiQrPharmacyId])
 
   const uploadPrescription = async () => {
     if (!prescriptionFile) {
@@ -2751,23 +2798,39 @@ function CheckoutPage({
         <div className="payment-stack">
           {['Cash on Delivery', 'UPI Payment'].map((option) => (
             <button
+              type="button"
               key={option}
               className={paymentMethod === option ? 'payment-option selected' : 'payment-option'}
               onClick={() => { setQuote(null); setPaymentMethod(option) }}
+              aria-pressed={paymentMethod === option}
             >
               <span>{option}</span>
               {paymentMethod === option ? <Check className="icon" /> : <span className="dot" />}
             </button>
           ))}
         </div>
-        <p className="checkout-quote-prompt">UPI remains pending until a verified payment gateway confirms payment. Choosing UPI here does not mark the order paid.</p>
+        {paymentMethod === 'UPI Payment' && (
+          <section className="upi-checkout-panel" aria-live="polite">
+            <h4>Pay {cart[0]?.pharmacyName} with UPI</h4>
+            {upiQrStatus === 'loading' && <p>Loading this pharmacy’s QR code…</p>}
+            {upiQrStatus === 'ready' && (
+              <>
+                <img src={upiQrImageUrl} alt={`UPI payment QR for ${cart[0]?.pharmacyName}`} />
+                <p>{activeQuote ? `Confirm ₹${activeQuote.total.toLocaleString('en-IN')} in your UPI app.` : 'Get a confirmed total before paying.'}</p>
+              </>
+            )}
+            {(upiQrStatus === 'missing' || upiQrStatus === 'error') && <p className="owner-form-error" role="alert">{upiQrError}</p>}
+            <p>Verify the pharmacy and amount in your UPI app. Payment remains pending until verified by a payment gateway.</p>
+          </section>
+        )}
         {error && <p className="owner-form-error" role="alert">{error}</p>}
         <button
           type="button"
           className="primary-cta dark"
           disabled={saving || quoteLoading || addressLoading ||
             (fulfillmentMethod === 'delivery' && !selectedAddress) ||
-            (restrictedItems.length > 0 && !selectedPrescription)}
+            (restrictedItems.length > 0 && !selectedPrescription) ||
+            (paymentMethod === 'UPI Payment' && activeQuote !== null && upiQrStatus !== 'ready')}
           onClick={() => void (activeQuote ? placeOrder() : requestQuote())}
         >
           {quoteLoading ? 'Checking current prices and stock…' : saving ? 'Placing order…' : activeQuote ? 'Confirm quote and place order' : 'Get confirmed total'}
@@ -3183,6 +3246,12 @@ function MarketplaceSettingsScreen({ token }: { token: string }) {
   const [form, setForm] = useState({ latitude: '', longitude: '', deliveryFee: '', pickupAvailable: true })
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
+  const [upiQrFile, setUpiQrFile] = useState<File | null>(null)
+  const [upiQrAvailable, setUpiQrAvailable] = useState(false)
+  const [upiQrSaving, setUpiQrSaving] = useState(false)
+  const [upiQrError, setUpiQrError] = useState('')
+  const [upiQrMessage, setUpiQrMessage] = useState('')
+  const upiQrFileInput = useRef<HTMLInputElement>(null)
   const [error, setError] = useState('')
   const [message, setMessage] = useState('')
 
@@ -3199,6 +3268,7 @@ function MarketplaceSettingsScreen({ token }: { token: string }) {
           deliveryFee: result.deliveryFee === '' ? '' : String(result.deliveryFee),
           pickupAvailable: result.pickupAvailable,
         })
+        if (!cancelled) setUpiQrAvailable(result.upiQrAvailable === true)
       } catch (requestError) {
         if (!cancelled) setError(requestError instanceof Error ? requestError.message : 'Could not load marketplace settings.')
       } finally {
@@ -3235,6 +3305,55 @@ function MarketplaceSettingsScreen({ token }: { token: string }) {
     }
   }
 
+  const uploadUpiQr = async () => {
+    if (!upiQrFile) {
+      setUpiQrError('Choose a PNG, JPEG, or WebP QR image first.')
+      return
+    }
+    setUpiQrSaving(true)
+    setUpiQrError('')
+    setUpiQrMessage('')
+    try {
+      const body = new FormData()
+      body.append('file', upiQrFile)
+      const response = await ownerApiFetch('/api/owner/marketplace-settings/upi-qr', token, {
+        method: 'POST',
+        body,
+      })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.error || 'Could not save your UPI QR image.')
+      setUpiQrAvailable(true)
+      setUpiQrFile(null)
+      if (upiQrFileInput.current) upiQrFileInput.current.value = ''
+      setUpiQrMessage('Your UPI QR is saved and will be shown to customers at checkout.')
+    } catch (requestError) {
+      setUpiQrError(requestError instanceof Error ? requestError.message : 'Could not save your UPI QR image.')
+    } finally {
+      setUpiQrSaving(false)
+    }
+  }
+
+  const removeUpiQr = async () => {
+    setUpiQrSaving(true)
+    setUpiQrError('')
+    setUpiQrMessage('')
+    try {
+      const response = await ownerApiFetch('/api/owner/marketplace-settings/upi-qr', token, { method: 'DELETE' })
+      if (!response.ok) {
+        const result = await response.json()
+        throw new Error(result.error || 'Could not remove your UPI QR image.')
+      }
+      setUpiQrAvailable(false)
+      setUpiQrFile(null)
+      if (upiQrFileInput.current) upiQrFileInput.current.value = ''
+      setUpiQrMessage('Your UPI QR has been removed.')
+    } catch (requestError) {
+      setUpiQrError(requestError instanceof Error ? requestError.message : 'Could not remove your UPI QR image.')
+    } finally {
+      setUpiQrSaving(false)
+    }
+  }
+
   return (
     <section className="marketplace-settings-panel">
       <div className="pharmacy-page-heading">
@@ -3243,23 +3362,64 @@ function MarketplaceSettingsScreen({ token }: { token: string }) {
       {error && <p className="owner-form-error" role="alert">{error}</p>}
       {message && <p className="verification-success" role="status">{message}</p>}
       {loading ? <p className="inventory-note">Loading marketplace settings…</p> : (
-        <form className="marketplace-settings-form" onSubmit={(event) => void saveSettings(event)}>
-          <label>Delivery fee (₹)
-            <input type="number" min="0" max="100000" step="0.01" placeholder="Leave blank if not disclosed" value={form.deliveryFee} onChange={(event) => setForm((current) => ({ ...current, deliveryFee: event.target.value }))} />
-          </label>
-          <label className="marketplace-pickup-toggle">
-            <input type="checkbox" checked={form.pickupAvailable} onChange={(event) => setForm((current) => ({ ...current, pickupAvailable: event.target.checked }))} />
-            <span>Customers can pick up orders from this pharmacy</span>
-          </label>
-          <div className="marketplace-coordinate-note">Coordinates are used only for approximate straight-line distance; no reverse geocoding is performed.</div>
-          <label>Latitude
-            <input type="number" min="-90" max="90" step="any" placeholder="Optional" value={form.latitude} onChange={(event) => setForm((current) => ({ ...current, latitude: event.target.value }))} />
-          </label>
-          <label>Longitude
-            <input type="number" min="-180" max="180" step="any" placeholder="Optional" value={form.longitude} onChange={(event) => setForm((current) => ({ ...current, longitude: event.target.value }))} />
-          </label>
-          <button type="submit" className="accept-action" disabled={saving}>{saving ? 'Saving…' : 'Save marketplace details'}</button>
-        </form>
+        <>
+          <form className="marketplace-settings-form" onSubmit={(event) => void saveSettings(event)}>
+            <label>Delivery fee (₹)
+              <input type="number" min="0" max="100000" step="0.01" placeholder="Leave blank if not disclosed" value={form.deliveryFee} onChange={(event) => setForm((current) => ({ ...current, deliveryFee: event.target.value }))} />
+            </label>
+            <label className="marketplace-pickup-toggle">
+              <input type="checkbox" checked={form.pickupAvailable} onChange={(event) => setForm((current) => ({ ...current, pickupAvailable: event.target.checked }))} />
+              <span>Customers can pick up orders from this pharmacy</span>
+            </label>
+            <div className="marketplace-coordinate-note">Coordinates are used only for approximate straight-line distance; no reverse geocoding is performed.</div>
+            <label>Latitude
+              <input type="number" min="-90" max="90" step="any" placeholder="Optional" value={form.latitude} onChange={(event) => setForm((current) => ({ ...current, latitude: event.target.value }))} />
+            </label>
+            <label>Longitude
+              <input type="number" min="-180" max="180" step="any" placeholder="Optional" value={form.longitude} onChange={(event) => setForm((current) => ({ ...current, longitude: event.target.value }))} />
+            </label>
+            <button type="submit" className="accept-action" disabled={saving}>{saving ? 'Saving…' : 'Save marketplace details'}</button>
+          </form>
+          <section className="marketplace-upi-settings">
+            <div>
+              <h4>UPI QR code</h4>
+              <p>Customers can scan this code at checkout. UPI orders remain pending until a payment gateway confirms payment.</p>
+            </div>
+            <label>
+              Upload QR image (PNG, JPEG, or WebP; max 1 MB)
+              <input
+                ref={upiQrFileInput}
+                type="file"
+                accept="image/png,image/jpeg,image/webp"
+                onChange={(event) => {
+                  const file = event.target.files?.[0] ?? null
+                  if (file && !['image/png', 'image/jpeg', 'image/webp'].includes(file.type)) {
+                    setUpiQrError('Choose a PNG, JPEG, or WebP QR image.')
+                    setUpiQrFile(null)
+                    event.currentTarget.value = ''
+                    return
+                  }
+                  if (file && file.size > 1024 * 1024) {
+                    setUpiQrError('UPI QR images must be 1 MB or smaller.')
+                    setUpiQrFile(null)
+                    event.currentTarget.value = ''
+                    return
+                  }
+                  setUpiQrFile(file)
+                  setUpiQrError('')
+                  setUpiQrMessage('')
+                }}
+              />
+            </label>
+            <p className="marketplace-upi-status">{upiQrAvailable ? 'A UPI QR is saved for your pharmacy.' : 'No UPI QR has been added.'}{upiQrFile ? ` Selected: ${upiQrFile.name}` : ''}</p>
+            {upiQrError && <p className="owner-form-error" role="alert">{upiQrError}</p>}
+            {upiQrMessage && <p className="verification-success" role="status">{upiQrMessage}</p>}
+            <div className="marketplace-upi-actions">
+              <button type="button" className="accept-action" disabled={upiQrSaving || !upiQrFile} onClick={() => void uploadUpiQr()}>{upiQrSaving ? 'Saving…' : 'Save UPI QR'}</button>
+              {upiQrAvailable && <button type="button" className="quiet-action" disabled={upiQrSaving} onClick={() => void removeUpiQr()}>Remove QR</button>}
+            </div>
+          </section>
+        </>
       )}
     </section>
   )

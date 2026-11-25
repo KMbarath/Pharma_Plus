@@ -435,6 +435,13 @@ CREATE TABLE IF NOT EXISTS pharmacy_settings (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS pharmacy_upi_qr_codes (
+  pharmacy_id BIGINT PRIMARY KEY REFERENCES pharmacies(id) ON DELETE CASCADE,
+  mime_type TEXT NOT NULL CHECK (mime_type IN ('image/png', 'image/jpeg', 'image/webp')),
+  image_data BYTEA NOT NULL CHECK (octet_length(image_data) BETWEEN 1 AND 1048576),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS owner_accounts (
   id SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
   email TEXT NOT NULL UNIQUE,
