@@ -18,6 +18,7 @@ import Star from 'lucide-react/icons/star'
 import Truck from 'lucide-react/icons/truck'
 import User from 'lucide-react/icons/user'
 import X from 'lucide-react/icons/x'
+import Users from 'lucide-react/icons/users'
 import ClipboardList from 'lucide-react/icons/clipboard-list'
 import LogOut from 'lucide-react/icons/log-out'
 import LogIn from 'lucide-react/icons/log-in'
@@ -33,6 +34,7 @@ import Pencil from 'lucide-react/icons/pencil'
 import Trash2 from 'lucide-react/icons/trash-2'
 import type { LucideIcon } from 'lucide-react'
 import { BrowserRouter, Navigate, NavLink, Route, Routes, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
+import { customerText, supportedCustomerLocales, type CustomerLocale } from './i18n'
 import './ReferenceDesign.css'
 
 type Product = {
@@ -103,6 +105,55 @@ type InventoryRecord = {
   available: boolean
   rating?: number
   reviewCount?: number
+}
+
+type StockMovement = {
+  id: number
+  type: string
+  quantityChange: number
+  note: string | null
+  createdAt: string
+  medicineId: number
+  medicineName: string
+  sku: string | null
+}
+
+type StockMovementSummary = StockMovement & {
+  changeCount: number
+}
+
+function summarizeRecentStockMovements(movements: StockMovement[]): StockMovementSummary[] {
+  const summaries: StockMovementSummary[] = []
+  const adjustmentGroups = new Map<string, StockMovementSummary>()
+
+  for (const movement of movements) {
+    if (movement.type !== 'adjustment') {
+      summaries.push({ ...movement, changeCount: 1 })
+      continue
+    }
+
+    const timestamp = Date.parse(movement.createdAt)
+    const key = `${movement.medicineId}:${movement.type}:${movement.note ?? ''}`
+    const existing = adjustmentGroups.get(key)
+    const previousTimestamp = existing ? Date.parse(existing.createdAt) : Number.NaN
+    if (
+      existing &&
+      Number.isFinite(timestamp) &&
+      Number.isFinite(previousTimestamp) &&
+      previousTimestamp >= timestamp &&
+      previousTimestamp - timestamp <= 30_000
+    ) {
+      existing.quantityChange += movement.quantityChange
+      existing.changeCount += 1
+      continue
+    }
+
+    const summary = { ...movement, changeCount: 1 }
+    adjustmentGroups.set(key, summary)
+    summaries.push(summary)
+  }
+
+  return summaries
 }
 
 type MedicineForm = {
@@ -268,6 +319,26 @@ type ProductComparison = {
 type OrderEvent = {
   status: string
   createdAt: string
+  actorRole: string
+  actorName: string
+  note: string | null
+}
+
+type OrderNotification = {
+  id: number
+  type: 'order_placed' | 'order_status' | 'refill_reminder' | 'stock_available'
+  title: string
+  message: string
+  referenceType: 'sales_order' | 'medicine'
+  referenceId: number
+  isRead: boolean
+  createdAt: string
+  eventStatus?: string
+  eventTime?: string
+  orderNumber?: string
+  currentStatus?: string
+  medicineName?: string
+  medicinePharmacyId?: number
 }
 
 type CustomerOrder = {
@@ -305,9 +376,19 @@ type CustomerOrder = {
     discountAmount: number
     taxAmount: number
     lineTotal: number
+    snapshot?: Record<string, unknown>
   }>
   events: OrderEvent[]
-  deliveryOtp?: string
+  idempotentReplay?: boolean
+}
+
+type ProductReview = {
+  id: number
+  rating: number
+  comment: string
+  createdAt: string
+  customerName: string
+  verifiedPurchase: boolean
 }
 
 type CheckoutQuoteLine = {
@@ -356,6 +437,44 @@ type CustomerProfile = {
   addresses: CustomerAddress[]
 }
 
+type CustomerSettings = {
+  language: CustomerLocale
+  theme: 'system' | 'light' | 'dark'
+  textScale: number
+  orderNotificationsEnabled: boolean
+  medicineNotificationsEnabled: boolean
+}
+
+const defaultCustomerSettings: CustomerSettings = {
+  language: 'en',
+  theme: 'system',
+  textScale: 1,
+  orderNotificationsEnabled: true,
+  medicineNotificationsEnabled: true,
+}
+
+type FamilyProfile = {
+  id: number
+  displayName: string
+  relationship: string
+  memberType: 'adult' | 'minor'
+  authorizationType: 'adult_consent' | 'guardian_authorization'
+  authorizationVersion: string
+  authorizationConfirmedAt: string
+  authorizationRevokedAt: string | null
+  removedAt: string | null
+  status: 'active' | 'revoked' | 'removed'
+  createdAt: string
+  updatedAt: string
+}
+
+type FamilyProfileForm = {
+  displayName: string
+  relationship: string
+  memberType: 'adult' | 'minor'
+  authorizationConfirmed: boolean
+}
+
 type OwnerSession = AccountSession
 
 type SessionResponse = {
@@ -365,6 +484,11 @@ type SessionResponse = {
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? ''
 const apiUrl = (path: string) => `${API_BASE_URL}${path}`
+const productImageSource = (imageUrl: string | null | undefined) => {
+  if (!imageUrl) return '/pharma-plus-icon.png'
+  if (/^(https?:|data:|blob:)/i.test(imageUrl)) return imageUrl
+  return imageUrl.startsWith('/api/') ? apiUrl(imageUrl) : imageUrl
+}
 
 type ProfileForm = {
   fullName: string
@@ -433,8 +557,87 @@ function authenticatedApiFetch(path: string, token: string, init: RequestInit = 
   return fetch(apiUrl(path), { ...init, headers })
 }
 
+function getOrderIdempotencyKey(customerId: number, cart: CartItem[], paymentMethod: string) {
+  const fingerprint = JSON.stringify({
+    pharmacyId: cart[0]?.pharmacyId ?? null,
+    paymentMethod,
+    items: cart
+      .map((item) => ({ medicineId: item.id, quantity: item.quantity, unitPrice: item.price }))
+      .sort((left, right) => left.medicineId - right.medicineId),
+  })
+  const storageKey = `pharma-plus-order-idempotency-${customerId}-${btoa(fingerprint)}`
+  const saved = localStorage.getItem(storageKey)
+  if (saved) return saved
+  const key = crypto.randomUUID()
+  localStorage.setItem(storageKey, key)
+  return key
+}
+
+function clearOrderIdempotencyKey(customerId: number, cart: CartItem[], paymentMethod: string, key: string) {
+  const fingerprint = JSON.stringify({
+    pharmacyId: cart[0]?.pharmacyId ?? null,
+    paymentMethod,
+    items: cart
+      .map((item) => ({ medicineId: item.id, quantity: item.quantity, unitPrice: item.price }))
+      .sort((left, right) => left.medicineId - right.medicineId),
+  })
+  const storageKey = `pharma-plus-order-idempotency-${customerId}-${btoa(fingerprint)}`
+  const saved = localStorage.getItem(storageKey)
+  if (saved === key) localStorage.removeItem(storageKey)
+}
+
 function ownerApiFetch(path: string, token: string, init: RequestInit = {}) {
   return authenticatedApiFetch(path, token, init)
+}
+
+function useRetryingPolling(load: () => Promise<boolean>) {
+  useEffect(() => {
+    let cancelled = false
+    let timer = 0
+    let retryDelay = 2000
+
+    const poll = async () => {
+      const succeeded = await load()
+      if (cancelled) return
+      if (succeeded) {
+        retryDelay = 2000
+        timer = window.setTimeout(() => void poll(), 15000)
+      } else {
+        timer = window.setTimeout(() => void poll(), retryDelay)
+        retryDelay = Math.min(retryDelay * 2, 60000)
+      }
+    }
+
+    void poll()
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [load])
+}
+
+function useUnreadNotificationCount(
+  path: string,
+  token: string,
+  fetcher: typeof authenticatedApiFetch,
+) {
+  const [unreadCount, setUnreadCount] = useState(0)
+  const [error, setError] = useState('')
+  const loadUnreadCount = useCallback(async () => {
+    try {
+      const response = await fetcher(path, token)
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.error || 'Could not load notifications.')
+      setUnreadCount(Number(result.unreadCount) || 0)
+      setError('')
+      return true
+    } catch {
+      setError('Could not refresh notifications. Showing the last known count; retrying automatically.')
+      return false
+    }
+  }, [fetcher, path, token])
+  useRetryingPolling(loadUnreadCount)
+  return { unreadCount, error }
 }
 
 const emptyMedicineForm = (): MedicineForm => ({
@@ -477,6 +680,7 @@ const sidebarItems: Array<{ label: string; icon: LucideIcon }> = [
   { label: 'Home', icon: LayoutGrid },
   { label: 'Orders', icon: ClipboardList },
   { label: 'Prescriptions', icon: ClipboardList },
+  { label: 'Notifications', icon: BellRing },
   { label: 'Medicines', icon: Pill },
   { label: 'Delivery', icon: Truck },
   { label: 'Verification', icon: BadgeAlert },
@@ -527,7 +731,7 @@ function App() {
         pack: item.pack,
         price: item.price,
         stock: item.stock,
-        image: item.imageUrl || '/pharma-plus-icon.png',
+        image: productImageSource(item.imageUrl),
         description: item.description || '',
         rating: item.rating,
         reviewCount: item.reviewCount,
@@ -672,6 +876,57 @@ function ApplicationRoutes({
   const [authError, setAuthError] = useState('')
   const [favoriteIds, setFavoriteIds] = useState<number[]>([])
   const [favoritesError, setFavoritesError] = useState('')
+  const [customerSettings, setCustomerSettings] = useState<CustomerSettings>(defaultCustomerSettings)
+  const [customerSettingsError, setCustomerSettingsError] = useState('')
+
+  useEffect(() => {
+    let cancelled = false
+    if (!accountSession || accountSession.user.role !== 'customer') {
+      return () => { cancelled = true }
+    }
+
+    const loadCustomerSettings = async () => {
+      try {
+        const response = await authenticatedApiFetch('/api/me/settings', accountSession.token)
+        const result = await response.json() as { settings?: CustomerSettings; error?: string }
+        if (!response.ok || !result.settings) throw new Error(result.error || 'Could not load customer preferences.')
+        if (!cancelled) {
+          setCustomerSettings(result.settings)
+          setCustomerSettingsError('')
+        }
+      } catch (requestError) {
+        if (!cancelled) {
+          setCustomerSettingsError(requestError instanceof Error ? requestError.message : 'Could not load customer preferences.')
+        }
+      }
+    }
+    void loadCustomerSettings()
+    return () => { cancelled = true }
+  }, [accountSession])
+
+  useEffect(() => {
+    const root = document.documentElement
+    const isCustomer = accountSession?.user.role === 'customer'
+    const systemTheme = window.matchMedia('(prefers-color-scheme: dark)')
+    const applyPreferences = () => {
+      if (!isCustomer) return
+      root.dataset.customerTheme = customerSettings.theme === 'system'
+        ? systemTheme.matches ? 'dark' : 'light'
+        : customerSettings.theme
+      root.lang = customerSettings.language
+      root.style.setProperty('--customer-font-scale', String(customerSettings.textScale))
+    }
+    applyPreferences()
+    if (isCustomer && customerSettings.theme === 'system') {
+      systemTheme.addEventListener('change', applyPreferences)
+    }
+    return () => {
+      systemTheme.removeEventListener('change', applyPreferences)
+      delete root.dataset.customerTheme
+      root.lang = 'en'
+      root.style.removeProperty('--customer-font-scale')
+    }
+  }, [accountSession, customerSettings])
 
   useEffect(() => {
     let cancelled = false
@@ -742,7 +997,10 @@ function ApplicationRoutes({
           return
         }
         if (!response.ok) throw new Error(result.error || 'Could not restore your sign-in.')
-        if (!cancelled) setAccountSession({ token, user: result.user })
+        if (!cancelled) {
+          setAccountSession({ token, user: result.user })
+          if (result.user.role === 'customer') setCustomerSettings(defaultCustomerSettings)
+        }
       } catch (requestError) {
         if (!cancelled) setAuthError(requestError instanceof Error ? requestError.message : 'Could not restore your sign-in.')
       } finally {
@@ -759,6 +1017,10 @@ function ApplicationRoutes({
 
   const handleAuthenticated = (session: AccountSession) => {
     saveAccountSession(session)
+    if (session.user.role === 'customer') {
+      setCustomerSettings(defaultCustomerSettings)
+      setCustomerSettingsError('')
+    }
     setAccountSession(session)
     setAuthError('')
     navigate(session.user.role === 'pharmacy_owner' ? '/dashboard' : '/', { replace: true })
@@ -774,6 +1036,7 @@ function ApplicationRoutes({
       }
     }
     localStorage.removeItem(SESSION_STORAGE_KEY)
+    setCustomerSettings(defaultCustomerSettings)
     setAccountSession(null)
     navigate('/welcome', { replace: true })
   }
@@ -827,6 +1090,7 @@ function ApplicationRoutes({
   return (
     <div className="app-shell">
       <div className="app-frame">
+        {customerSettingsError && <p className="owner-form-error" role="alert">{customerSettingsError}</p>}
         <Routes>
           <Route
             path="/"
@@ -883,8 +1147,22 @@ function ApplicationRoutes({
             }
           />
           <Route path="/orders/:orderId" element={<CustomerOrderTrackingPage session={accountSession} />} />
+          <Route path="/notifications" element={<OrderNotificationsPage session={accountSession} isOwner={false} />} />
           <Route path="/orders" element={<CustomerOrdersPage session={accountSession} />} />
-          <Route path="/profile" element={<CustomerProfilePage session={accountSession} onSignOut={() => void signOut()} />} />
+          <Route
+            path="/profile"
+            element={
+              <CustomerProfilePage
+                session={accountSession}
+                settings={customerSettings}
+                onSettingsChange={(settings) => {
+                  setCustomerSettings(settings)
+                  setCustomerSettingsError('')
+                }}
+                onSignOut={() => void signOut()}
+              />
+            }
+          />
           <Route path="/product/:id/reviews" element={
             <ProductDetailPage
               products={products}
@@ -959,8 +1237,11 @@ function CustomerHomePage({
   const [query, setQuery] = useState('')
   const [pharmacyQuery, setPharmacyQuery] = useState('')
   const [pharmacyPickerOpen, setPharmacyPickerOpen] = useState(false)
-  const [notificationCount, setNotificationCount] = useState(0)
-  const [notificationError, setNotificationError] = useState('')
+  const { unreadCount: notificationCount, error: notificationError } = useUnreadNotificationCount(
+    '/api/me/notifications',
+    session.token,
+    authenticatedApiFetch,
+  )
   const [profilePhoto] = useState(() => localStorage.getItem(`pharma-plus-profile-photo-${session.user.id}`) || '')
   const [greeting] = useState(() => {
     const hour = new Date().getHours()
@@ -976,29 +1257,6 @@ function CustomerHomePage({
     pharmacy.name.toLowerCase().includes(pharmacyQuery.trim().toLowerCase()),
   )
 
-  useEffect(() => {
-    let cancelled = false
-    const loadNotifications = async () => {
-      try {
-        const response = await authenticatedApiFetch('/api/customer/orders', session.token)
-        const result = await response.json()
-        if (!response.ok) throw new Error(result.error || 'Could not load notifications.')
-        if (!cancelled) {
-          setNotificationCount((result as CustomerOrder[]).filter((order) => !['delivered', 'declined', 'cancelled'].includes(order.status)).length)
-          setNotificationError('')
-        }
-      } catch (requestError) {
-        if (!cancelled) setNotificationError(requestError instanceof Error ? requestError.message : 'Could not load notifications.')
-      }
-    }
-    void loadNotifications()
-    const timer = window.setInterval(() => void loadNotifications(), 15000)
-    return () => {
-      cancelled = true
-      window.clearInterval(timer)
-    }
-  }, [session.token])
-
   return (
     <motion.div initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -18 }} className="screen customer-screen">
       <header className="topbar customer-topbar">
@@ -1009,7 +1267,7 @@ function CustomerHomePage({
         </button>
         <div className="home-brand"><span className="brand-mark">P+</span><strong>Pharma <span>Plus</span></strong></div>
         <div className="home-header-actions">
-          <button type="button" className="icon-button notification-button" aria-label={`Notifications${notificationCount ? `, ${notificationCount} active orders` : ''}`} onClick={() => navigate('/orders')}>
+          <button type="button" className="icon-button notification-button" aria-label={`Notifications${notificationCount ? `, ${notificationCount} unread` : ''}`} onClick={() => navigate('/notifications')}>
             <Bell className="icon" />
             {notificationCount > 0 && <span className="notification-badge">{notificationCount > 9 ? '9+' : notificationCount}</span>}
           </button>
@@ -1167,16 +1425,39 @@ function CustomerBottomNav() {
             key={tab}
             type="button"
             className={active ? 'bottom-nav-item active' : 'bottom-nav-item'}
+            aria-current={active ? 'page' : undefined}
             onClick={() => navigate(navPaths[index])}
           >
-            <span className="nav-icon-wrap">
-              <Icon className="icon" />
-            </span>
-            <span>{tab}</span>
+            <NavigationItemIcon icon={Icon} active={active} layoutId="customer-navigation-active" />
+            <span className="nav-label">{tab}</span>
           </button>
         )
       })}
     </nav>
+  )
+}
+
+function NavigationItemIcon({
+  icon: Icon,
+  active,
+  layoutId,
+}: {
+  icon: LucideIcon
+  active: boolean
+  layoutId: string
+}) {
+  return (
+    <span className="nav-icon-slot">
+      {active ? (
+        <motion.span
+          layoutId={layoutId}
+          className="nav-active-bubble"
+          transition={{ type: 'spring', stiffness: 420, damping: 32 }}
+        >
+          <span><Icon className="icon" aria-hidden="true" /></span>
+        </motion.span>
+      ) : <Icon className="icon" aria-hidden="true" />}
+    </span>
   )
 }
 
@@ -1347,11 +1628,12 @@ function BackButton({ fallback = '/' }: { fallback?: string }) {
   )
 }
 
-const orderSteps = ['pending', 'accepted', 'preparing', 'out_for_delivery', 'delivered']
+const orderSteps = ['pending', 'accepted', 'preparing', 'ready', 'out_for_delivery', 'delivered']
 const orderStatusLabel: Record<string, string> = {
   pending: 'Order placed',
   accepted: 'Accepted by pharmacy',
-  preparing: 'Packed and ready',
+  preparing: 'Preparing / Packed',
+  ready: 'Ready for dispatch',
   out_for_delivery: 'Out for delivery',
   delivered: 'Delivered',
   declined: 'Declined',
@@ -1368,7 +1650,12 @@ function OrderTimeline({ order }: { order: CustomerOrder }) {
         return (
           <div className={`order-timeline-step ${reached ? 'reached' : ''} ${active ? 'current' : ''}`} key={status}>
             <span className="order-timeline-marker">{reached ? <Check className="icon" /> : null}</span>
-            <div><strong>{orderStatusLabel[status]}</strong>{event && <small>{new Date(event.createdAt).toLocaleString()}</small>}</div>
+            <div>
+              <strong>{orderStatusLabel[status]}</strong>
+              {event && <small>{new Date(event.createdAt).toLocaleString()}</small>}
+              {event && <small>Updated by {event.actorName}</small>}
+              {event?.note && <small className="order-timeline-note">{event.note}</small>}
+            </div>
           </div>
         )
       })}
@@ -1382,9 +1669,120 @@ function OrderTimeline({ order }: { order: CustomerOrder }) {
   )
 }
 
+function OrderNotificationsPage({
+  session,
+  isOwner,
+}: {
+  session: AccountSession
+  isOwner: boolean
+}) {
+  const navigate = useNavigate()
+  const [notifications, setNotifications] = useState<OrderNotification[]>([])
+  const [unreadCount, setUnreadCount] = useState(0)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const endpoint = isOwner ? '/api/owner/notifications' : '/api/me/notifications'
+  const fetcher = isOwner ? ownerApiFetch : authenticatedApiFetch
+  const loadNotifications = useCallback(async () => {
+    try {
+      const response = await fetcher(endpoint, session.token)
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.error || 'Could not load notifications.')
+      setNotifications(result.notifications as OrderNotification[])
+      setUnreadCount(Number(result.unreadCount) || 0)
+      setError('')
+      return true
+    } catch {
+      setError('Could not refresh notifications. Showing the last known updates; retrying automatically.')
+      return false
+    } finally {
+      setLoading(false)
+    }
+  }, [endpoint, fetcher, session.token])
+
+  useRetryingPolling(loadNotifications)
+
+  const openNotification = async (notification: OrderNotification) => {
+    if (!notification.isRead) {
+      try {
+        const response = await fetcher(
+          `${endpoint}/${notification.id}`,
+          session.token,
+          { method: 'PATCH' },
+        )
+        if (!response.ok) {
+          const result = await response.json()
+          throw new Error(result.error || 'Could not mark this notification as read.')
+        }
+        setNotifications((current) => current.map((item) =>
+          item.id === notification.id ? { ...item, isRead: true } : item,
+        ))
+        setUnreadCount((current) => Math.max(0, current - 1))
+      } catch {
+        setError('Could not update this notification. Check your connection and try again.')
+        return
+      }
+    }
+    if (!isOwner && notification.referenceType === 'medicine') {
+      navigate(`/product/${notification.referenceId}`)
+      return
+    }
+    navigate(isOwner ? `/dashboard/orders/${notification.referenceId}` : `/orders/${notification.referenceId}`)
+  }
+
+  return (
+    <main className={`screen customer-page-screen notifications-screen ${isOwner ? 'owner-notifications-screen' : ''}`}>
+      <header className="customer-page-header">
+        <BackButton fallback={isOwner ? '/dashboard' : '/'} />
+        <p className="eyebrow">{isOwner ? 'PHARMACY WORKSPACE' : 'PHARMA PLUS'}</p>
+        <h1>Notifications</h1>
+        <p>{unreadCount ? `${unreadCount} unread order update${unreadCount === 1 ? '' : 's'}.` : 'Order updates appear here after they are committed.'}</p>
+      </header>
+      {error && <p className="owner-form-error" role="status">{error}</p>}
+      {loading && !notifications.length ? (
+        <p className="inventory-note">Loading notifications…</p>
+      ) : notifications.length ? (
+        <div className="notification-inbox-list">
+          {notifications.map((notification) => (
+            <button
+              type="button"
+              className={`notification-card ${notification.isRead ? 'read' : 'unread'}`}
+              key={notification.id}
+              onClick={() => void openNotification(notification)}
+            >
+              <span className="notification-card-icon"><BellRing className="icon" /></span>
+              <span className="notification-card-content">
+                <strong>{notification.title}</strong>
+                <span>{notification.message}</span>
+                {notification.referenceType === 'sales_order' ? (
+                  <small>
+                    {notification.orderNumber} · Current status: {orderStatusLabel[notification.currentStatus ?? ''] ?? notification.currentStatus}
+                  </small>
+                ) : (
+                  <small>{notification.medicineName ?? 'Medicine'} · Open the current catalog</small>
+                )}
+                <small>{new Date(notification.eventTime ?? notification.createdAt).toLocaleString()}</small>
+              </span>
+              {!notification.isRead && <span className="notification-unread-dot" aria-label="Unread" />}
+            </button>
+          ))}
+        </div>
+      ) : (
+        <div className="empty-state-card compact-empty">
+          <Bell className="empty-state-icon" />
+          <h2>No notifications yet</h2>
+          <p>Order updates will appear here as soon as the pharmacy changes the order status.</p>
+        </div>
+      )}
+      {!isOwner && <CustomerBottomNav />}
+    </main>
+  )
+}
+
 function CustomerOrdersPage({ session }: { session: AccountSession }) {
   const navigate = useNavigate()
   const [orders, setOrders] = useState<CustomerOrder[]>([])
+  const [deliveryCodes, setDeliveryCodes] = useState<Record<number, string>>({})
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [filter, setFilter] = useState<'all' | 'active' | 'delivered'>('all')
@@ -1396,24 +1794,30 @@ function CustomerOrdersPage({ session }: { session: AccountSession }) {
       if (!response.ok) throw new Error(result.error || 'Could not load your orders.')
       const nextOrders = result as CustomerOrder[]
       setOrders(nextOrders)
-      setError('')
       for (const order of nextOrders) {
-        if (order.status === 'delivered') localStorage.removeItem(`pharma-plus-delivery-otp-${session.user.id}-${order.id}`)
+        localStorage.removeItem(`pharma-plus-delivery-otp-${session.user.id}-${order.id}`)
       }
-    } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : 'Could not load your orders.')
+      const codes = await Promise.all(nextOrders
+        .filter((order) => order.status === 'out_for_delivery')
+        .map(async (order) => {
+          const codeResponse = await authenticatedApiFetch(`/api/me/orders/${order.id}/delivery-code`, session.token)
+          const codeResult = await codeResponse.json()
+          if (codeResponse.status === 409) return [order.id, ''] as const
+          if (!codeResponse.ok) throw new Error(codeResult.error || 'Could not load a delivery code.')
+          return [order.id, codeResult.code as string] as const
+        }))
+      setDeliveryCodes(Object.fromEntries(codes.filter(([, code]) => code)))
+      setError('')
+      return true
+    } catch {
+      setError('Could not refresh orders. Showing the last known statuses; retrying automatically.')
+      return false
     } finally {
       setLoading(false)
     }
   }, [session.token, session.user.id])
 
-  useEffect(() => {
-    // Keep order status and delivery notifications current while this page is open.
-    // oxlint-disable-next-line react/set-state-in-effect
-    void loadOrders()
-    const timer = window.setInterval(() => void loadOrders(), 15000)
-    return () => window.clearInterval(timer)
-  }, [loadOrders])
+  useRetryingPolling(loadOrders)
 
   const visibleOrders = orders.filter((order) => {
     if (filter === 'active') return !['delivered', 'declined', 'cancelled'].includes(order.status)
@@ -1440,7 +1844,7 @@ function CustomerOrdersPage({ session }: { session: AccountSession }) {
       {loading ? <div className="empty-state-card compact-empty">Loading your orders…</div> : visibleOrders.length ? (
         <div className="customer-orders-list">
           {visibleOrders.map((order) => {
-            const otp = localStorage.getItem(`pharma-plus-delivery-otp-${session.user.id}-${order.id}`)
+            const code = deliveryCodes[order.id]
             return (
               <article className="customer-order-card" key={order.id}>
                 <header className="customer-order-header">
@@ -1452,11 +1856,24 @@ function CustomerOrdersPage({ session }: { session: AccountSession }) {
                 <div className="customer-order-items">
                   {order.items.map((item) => <div key={`${order.id}-${item.medicineId}`}><span>{item.name} × {formatOrderItemQuantity(item)}</span><strong>₹{item.lineTotal.toLocaleString('en-IN')}</strong></div>)}
                 </div>
+                {order.status === 'delivered' && (
+                  <div className="customer-order-review-links">
+                    {order.items.map((item) => (
+                      <button
+                        type="button"
+                        key={`${order.id}-review-${item.medicineId}`}
+                        onClick={() => navigate(`/product/${item.medicineId}/reviews`)}
+                      >
+                        Review {item.name}
+                      </button>
+                    ))}
+                  </div>
+                )}
                 <div className="customer-order-total"><span>Total</span><strong>₹{order.total.toLocaleString('en-IN')}</strong></div>
                 <OrderTimeline order={order} />
                 <button type="button" className="track-order-button" onClick={() => navigate(`/orders/${order.id}`)}>View tracking <ArrowUpRight className="icon" /></button>
-                {order.status === 'out_for_delivery' && otp && (
-                  <div className="delivery-otp-card"><span>Share this delivery code with your pharmacy</span><strong>{otp}</strong><small>Only share when your order arrives.</small></div>
+                {order.status === 'out_for_delivery' && code && (
+                  <div className="delivery-otp-card"><span>Share this delivery code with your pharmacy</span><strong>{code}</strong><small>Only share when your order arrives.</small></div>
                 )}
                 <p className="customer-order-address"><MapPin className="icon" /> {order.fulfillmentMethod === 'pickup' ? 'Pharmacy pickup' : formatOrderLocation(order)}</p>
               </article>
@@ -1707,34 +2124,42 @@ function CustomerProductComparePage({
 function CustomerOrderTrackingPage({ session }: { session: AccountSession }) {
   const { orderId } = useParams()
   const [order, setOrder] = useState<CustomerOrder | null>(null)
+  const [deliveryCode, setDeliveryCode] = useState('')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
 
   const loadOrder = useCallback(async () => {
     try {
-      const response = await authenticatedApiFetch('/api/customer/orders', session.token)
-      const result = await response.json()
+      const [response, eventsResponse] = await Promise.all([
+        authenticatedApiFetch(`/api/orders/${orderId}`, session.token),
+        authenticatedApiFetch(`/api/me/orders/${orderId}/events`, session.token),
+      ])
+      const [result, events] = await Promise.all([response.json(), eventsResponse.json()])
       if (!response.ok) throw new Error(result.error || 'Could not load this order.')
-      const found = (result as CustomerOrder[]).find((entry) => entry.id === Number(orderId))
-      if (!found) throw new Error('This order could not be found in your account.')
+      if (!eventsResponse.ok) throw new Error(events.error || 'Could not load order updates.')
+      const found = { ...result, events } as CustomerOrder
       setOrder(found)
+      localStorage.removeItem(`pharma-plus-delivery-otp-${session.user.id}-${found.id}`)
+      if (found.status === 'out_for_delivery') {
+        const codeResponse = await authenticatedApiFetch(`/api/me/orders/${found.id}/delivery-code`, session.token)
+        const codeResult = await codeResponse.json()
+        if (codeResponse.status === 409) setDeliveryCode('')
+        else if (!codeResponse.ok) throw new Error(codeResult.error || 'Could not load the delivery code.')
+        else setDeliveryCode(codeResult.code as string)
+      } else {
+        setDeliveryCode('')
+      }
       setError('')
-    } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : 'Could not load this order.')
+      return true
+    } catch {
+      setError('Could not refresh this order. Showing the last known status; retrying automatically.')
+      return false
     } finally {
       setLoading(false)
     }
-  }, [orderId, session.token])
+  }, [orderId, session.token, session.user.id])
 
-  useEffect(() => {
-    // Poll the authorized customer order list so its timeline stays current.
-    // oxlint-disable-next-line react/set-state-in-effect
-    void loadOrder()
-    const timer = window.setInterval(() => void loadOrder(), 15000)
-    return () => window.clearInterval(timer)
-  }, [loadOrder])
-
-  const otp = order ? localStorage.getItem(`pharma-plus-delivery-otp-${session.user.id}-${order.id}`) : null
+  useRetryingPolling(loadOrder)
 
   return (
     <motion.main className="screen customer-page-screen tracking-page-screen" initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }}>
@@ -1757,10 +2182,10 @@ function CustomerOrderTrackingPage({ session }: { session: AccountSession }) {
             {order.paymentMethod === 'UPI Payment' && order.paymentStatus === 'pending' && <p className="checkout-quote-prompt">UPI payment is pending; it is not considered paid until verified by a payment gateway.</p>}
             <OrderTimeline order={order} />
           </section>
-          {otp && order.status !== 'delivered' && (
+          {deliveryCode && order.status === 'out_for_delivery' && (
             <section className="delivery-code-card">
               <div><span className="delivery-code-icon"><PackageCheck className="icon" /></span><div><h2>Your delivery code</h2><p>Share this only when your order is handed to you.</p></div></div>
-              <strong>{otp}</strong>
+              <strong>{deliveryCode}</strong>
             </section>
           )}
           <section className="tracking-items-card">
@@ -1778,9 +2203,13 @@ function CustomerOrderTrackingPage({ session }: { session: AccountSession }) {
 
 function CustomerProfilePage({
   session,
+  settings,
+  onSettingsChange,
   onSignOut,
 }: {
   session: AccountSession
+  settings: CustomerSettings
+  onSettingsChange: (settings: CustomerSettings) => void
   onSignOut: () => void
 }) {
   const navigate = useNavigate()
@@ -1796,7 +2225,23 @@ function CustomerProfilePage({
   const [error, setError] = useState('')
   const [message, setMessage] = useState('')
   const [busy, setBusy] = useState(false)
+  const [settingsFormDraft, setSettingsFormDraft] = useState<CustomerSettings | null>(null)
   const [profilePhoto, setProfilePhoto] = useState(() => localStorage.getItem(`pharma-plus-profile-photo-${session.user.id}`) || '')
+  const [familyProfiles, setFamilyProfiles] = useState<FamilyProfile[]>([])
+  const [familyLoading, setFamilyLoading] = useState(true)
+  const [familyEditorOpen, setFamilyEditorOpen] = useState(false)
+  const [editingFamilyProfileId, setEditingFamilyProfileId] = useState<number | null>(null)
+  const [familyForm, setFamilyForm] = useState<FamilyProfileForm>({
+    displayName: '',
+    relationship: '',
+    memberType: 'adult',
+    authorizationConfirmed: false,
+  })
+  const [reminders, setReminders] = useState<Array<{ id: number; medicineId: number; medicineName: string; pharmacyName: string | null; optIn: boolean; nextReminderDate: string; intervalDays: number; cancelledAt: string | null }>>([])
+  const [stockAlerts, setStockAlerts] = useState<Array<{ id: number; medicineId: number; medicineName: string; active: boolean }>>([])
+  const [alertHistory, setAlertHistory] = useState<Array<{ id: number; medicineId: number; alertType: string; status: string; reason: string | null; createdAt: string }>>([])
+  const [reminderLoading, setReminderLoading] = useState(false)
+  const settingsForm = settingsFormDraft ?? settings
 
   const applyProfile = (nextProfile: CustomerProfile) => {
     setProfile(nextProfile)
@@ -1810,22 +2255,27 @@ function CustomerProfilePage({
     let cancelled = false
     const loadProfile = async () => {
       try {
-        const [profileResponse, addressesResponse] = await Promise.all([
+        const [profileResponse, addressesResponse, familyResponse] = await Promise.all([
           authenticatedApiFetch('/api/me/profile', session.token),
           authenticatedApiFetch('/api/me/addresses', session.token),
+          authenticatedApiFetch('/api/me/family', session.token),
         ])
         const profileResult = await profileResponse.json()
         const addressesResult = await addressesResponse.json()
+        const familyResult = await familyResponse.json() as { familyProfiles?: FamilyProfile[]; error?: string }
         if (!profileResponse.ok) throw new Error(profileResult.error || 'Could not load your profile.')
         if (!addressesResponse.ok) throw new Error(addressesResult.error || 'Could not load your saved addresses.')
+        if (!familyResponse.ok) throw new Error(familyResult.error || 'Could not load your family profiles.')
         if (!cancelled) applyProfile({
           user: profileResult.user,
           addresses: addressesResult.addresses,
         } as CustomerProfile)
+        if (!cancelled) setFamilyProfiles(familyResult.familyProfiles ?? [])
       } catch (requestError) {
         if (!cancelled) setError(requestError instanceof Error ? requestError.message : 'Could not load your profile.')
       } finally {
         if (!cancelled) setProfileLoading(false)
+        if (!cancelled) setFamilyLoading(false)
       }
     }
     // oxlint-disable-next-line react/set-state-in-effect
@@ -1833,6 +2283,151 @@ function CustomerProfilePage({
     return () => {
       cancelled = true
     }
+  }, [session.token])
+
+  const beginNewFamilyProfile = () => {
+    setEditingFamilyProfileId(null)
+    setFamilyForm({
+      displayName: '',
+      relationship: '',
+      memberType: 'adult',
+      authorizationConfirmed: false,
+    })
+    setFamilyEditorOpen(true)
+    setError('')
+    setMessage('')
+  }
+
+  const beginEditFamilyProfile = (familyProfile: FamilyProfile) => {
+    setEditingFamilyProfileId(familyProfile.id)
+    setFamilyForm({
+      displayName: familyProfile.displayName,
+      relationship: familyProfile.relationship,
+      memberType: familyProfile.memberType,
+      authorizationConfirmed: false,
+    })
+    setFamilyEditorOpen(true)
+    setError('')
+    setMessage('')
+  }
+
+  const saveFamilyProfile = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    setBusy(true)
+    setError('')
+    setMessage('')
+    const editing = editingFamilyProfileId !== null
+    try {
+      const response = await authenticatedApiFetch(
+        editing ? `/api/me/family/${editingFamilyProfileId}` : '/api/me/family',
+        session.token,
+        {
+          method: editing ? 'PATCH' : 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(editing
+            ? { displayName: familyForm.displayName, relationship: familyForm.relationship }
+            : familyForm),
+        },
+      )
+      const result = await response.json() as FamilyProfile & { error?: string }
+      if (!response.ok) throw new Error(result.error || 'Could not save this family profile.')
+      setFamilyProfiles((current) => editing
+        ? current.map((item) => item.id === result.id ? result : item)
+        : [...current, result])
+      setFamilyEditorOpen(false)
+      setEditingFamilyProfileId(null)
+      setMessage(editing ? 'Family profile updated.' : 'Family profile saved with your authorization.')
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Could not save this family profile.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const revokeFamilyAuthorization = async (familyProfile: FamilyProfile) => {
+    if (!window.confirm(`Revoke authorization for ${familyProfile.displayName}?`)) return
+    setBusy(true)
+    setError('')
+    setMessage('')
+    try {
+      const response = await authenticatedApiFetch(`/api/me/family/${familyProfile.id}/revoke`, session.token, {
+        method: 'POST',
+      })
+      const result = await response.json() as FamilyProfile & { error?: string }
+      if (!response.ok) throw new Error(result.error || 'Could not revoke family profile authorization.')
+      setFamilyProfiles((current) => current.map((item) => item.id === result.id ? result : item))
+      setMessage('Family profile authorization was revoked.')
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Could not revoke family profile authorization.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const removeFamilyProfile = async (familyProfile: FamilyProfile) => {
+    if (!window.confirm(`Remove ${familyProfile.displayName} from your family profiles? Personal details will be cleared.`)) return
+    setBusy(true)
+    setError('')
+    setMessage('')
+    try {
+      const response = await authenticatedApiFetch(`/api/me/family/${familyProfile.id}`, session.token, {
+        method: 'DELETE',
+      })
+      const result = await response.json() as FamilyProfile & { error?: string }
+      if (!response.ok) throw new Error(result.error || 'Could not remove this family profile.')
+      setFamilyProfiles((current) => current.map((item) => item.id === result.id ? result : item))
+      setMessage('Family profile removed. Personal details were cleared and the audit history was retained.')
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Could not remove this family profile.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const saveCustomerSettings = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    setBusy(true)
+    setError('')
+    setMessage('')
+    try {
+      const response = await authenticatedApiFetch('/api/me/settings', session.token, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(settingsForm),
+      })
+      const result = await response.json() as { settings?: CustomerSettings; error?: string }
+      if (!response.ok || !result.settings) throw new Error(result.error || 'Could not save your preferences.')
+      onSettingsChange(result.settings)
+      setSettingsFormDraft(result.settings)
+      setMessage('Your preferences were saved.')
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Could not save your preferences.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  useEffect(() => {
+    let cancelled = false
+    const loadReminders = async () => {
+      setReminderLoading(true)
+      try {
+        const response = await authenticatedApiFetch('/api/me/reminders', session.token)
+        const result = await response.json()
+        if (!response.ok) throw new Error(result.error || 'Could not load medicine alerts.')
+        if (!cancelled) {
+          setReminders(result.reminders ?? [])
+          setStockAlerts(result.stockAlerts ?? [])
+          setAlertHistory(result.history ?? [])
+        }
+      } catch (requestError) {
+        if (!cancelled) setError(requestError instanceof Error ? requestError.message : 'Could not load medicine alerts.')
+      } finally {
+        if (!cancelled) setReminderLoading(false)
+      }
+    }
+    void loadReminders()
+    return () => { cancelled = true }
   }, [session.token])
 
   const refreshAddresses = async () => {
@@ -1969,6 +2564,50 @@ function CustomerProfilePage({
     }
   }
 
+  const cancelReminder = async (id: number) => {
+    setBusy(true)
+    setError('')
+    try {
+      const response = await authenticatedApiFetch(`/api/me/reminders/${id}`, session.token, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ optIn: false }),
+      })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.error || 'Could not cancel the reminder.')
+      setReminders((current) => current.map((item) =>
+        item.id === id ? { ...item, optIn: false, cancelledAt: result.cancelledAt } : item,
+      ))
+      setMessage('Refill reminder cancelled.')
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Could not cancel the reminder.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const cancelStockAlert = async (id: number) => {
+    setBusy(true)
+    setError('')
+    try {
+      const response = await authenticatedApiFetch(`/api/me/stock-alerts/${id}`, session.token, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.error || 'Could not cancel the stock alert.')
+      setStockAlerts((current) => current.map((item) =>
+        item.id === id ? { ...item, active: false } : item,
+      ))
+      setMessage('Stock alert cancelled.')
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Could not cancel the stock alert.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const uploadProfilePhoto = (file?: File) => {
     if (!file) return
     if (!file.type.startsWith('image/')) {
@@ -2054,6 +2693,46 @@ function CustomerProfilePage({
             <div><Mail className="icon" /><span>{profile.user.email}</span></div>
             {profile.user.phone && <div><Phone className="icon" /><span>{profile.user.phone}</span></div>}
           </div>}
+          <section className="profile-edit-card reminder-preferences-card">
+            <div className="profile-edit-heading">
+              <span className="location-editor-icon"><BellRing className="icon" /></span>
+              <div><h2>Medicine reminders</h2><p>Opt-in reminders only. No automatic orders or medication advice.</p></div>
+            </div>
+            {reminderLoading ? <p className="profile-empty-location">Loading reminders…</p> : (
+              <>
+                {reminders.length ? (
+                  <div className="profile-address-list">
+                    {reminders.map((reminder) => (
+                      <article className="profile-contact-card" key={reminder.id}>
+                        <div><Pill className="icon" /><span><strong>{reminder.medicineName}</strong>{reminder.pharmacyName ? ` · ${reminder.pharmacyName}` : ''}</span></div>
+                        <small>Next: {reminder.nextReminderDate} · Every {reminder.intervalDays} day(s) · {reminder.optIn ? 'Active' : 'Cancelled'}</small>
+                        {reminder.optIn && <button type="button" className="text-action" disabled={busy} onClick={() => void cancelReminder(reminder.id)}>Cancel reminder</button>}
+                      </article>
+                    ))}
+                  </div>
+                ) : <p className="profile-empty-location">No refill reminders saved.</p>}
+                {stockAlerts.length ? (
+                  <div className="profile-address-list">
+                    {stockAlerts.map((alert) => (
+                      <article className="profile-contact-card" key={alert.id}>
+                        <div><CircleCheck className="icon" /><span><strong>{alert.medicineName}</strong> availability alert</span></div>
+                        <small>{alert.active ? 'Active — notify once stock is available' : 'Cancelled'}</small>
+                        {alert.active && <button type="button" className="text-action" disabled={busy} onClick={() => void cancelStockAlert(alert.id)}>Cancel stock alert</button>}
+                      </article>
+                    ))}
+                  </div>
+                ) : <p className="profile-empty-location">No out-of-stock alerts saved.</p>}
+                {alertHistory.length ? (
+                  <div className="reminder-history-list">
+                    <h3>Alert history</h3>
+                    {alertHistory.slice(0, 20).map((event) => (
+                      <p key={event.id}><strong>{event.alertType === 'refill_reminder' ? 'Refill reminder' : 'Stock available'}</strong> · {event.status} · {new Date(event.createdAt).toLocaleString()}</p>
+                    ))}
+                  </div>
+                ) : <p className="profile-empty-location">No alerts sent yet.</p>}
+              </>
+            )}
+          </section>
           <section className="profile-edit-card">
             <div className="profile-edit-heading">
               <span className="location-editor-icon"><MapPin className="icon" /></span>
@@ -2103,6 +2782,199 @@ function CustomerProfilePage({
               </form>
             )}
           </section>
+          <section className="profile-edit-card family-profiles-card">
+            <div className="profile-edit-heading">
+              <span className="location-editor-icon"><Users className="icon" /></span>
+              <div>
+                <h2>{customerText(settings.language, 'family.title')}</h2>
+                <p>{customerText(settings.language, 'family.description')}</p>
+              </div>
+              <button type="button" className="quiet-action" disabled={busy} onClick={beginNewFamilyProfile}>
+                {customerText(settings.language, 'family.add')}
+              </button>
+            </div>
+            <p className="family-privacy-note">
+              Names and relationships only. This authorization is your attestation; it is not independently verified.
+              Family members do not receive access to this account or its prescriptions.
+            </p>
+            {familyLoading ? <p className="profile-empty-location">Loading family profiles…</p> : familyProfiles.length ? (
+              <div className="profile-address-list">
+                {familyProfiles.map((familyProfile) => (
+                  <article className="profile-contact-card family-profile-card" key={familyProfile.id}>
+                    <div className="family-profile-header">
+                      <span>
+                        <strong>{familyProfile.displayName}</strong>
+                        <small>{familyProfile.relationship} · {familyProfile.memberType}</small>
+                      </span>
+                      <span className={`family-profile-status ${familyProfile.status}`}>{familyProfile.status}</span>
+                    </div>
+                    <small>
+                      {familyProfile.authorizationType === 'adult_consent' ? 'Adult consent' : 'Guardian authorization'} confirmed{' '}
+                      {new Date(familyProfile.authorizationConfirmedAt).toLocaleString()}
+                    </small>
+                    {familyProfile.authorizationRevokedAt && (
+                      <small>Authorization revoked {new Date(familyProfile.authorizationRevokedAt).toLocaleString()}</small>
+                    )}
+                    <div className="profile-address-actions">
+                      {familyProfile.status === 'active' && (
+                        <>
+                          <button type="button" className="text-action" disabled={busy} onClick={() => beginEditFamilyProfile(familyProfile)}>
+                            {customerText(settings.language, 'family.edit')}
+                          </button>
+                          <button type="button" className="text-action danger-text-action" disabled={busy} onClick={() => void revokeFamilyAuthorization(familyProfile)}>
+                            {customerText(settings.language, 'family.revoke')}
+                          </button>
+                        </>
+                      )}
+                      {familyProfile.status !== 'removed' && (
+                        <button type="button" className="text-action danger-text-action" disabled={busy} onClick={() => void removeFamilyProfile(familyProfile)}>
+                          {customerText(settings.language, 'family.remove')}
+                        </button>
+                      )}
+                    </div>
+                  </article>
+                ))}
+              </div>
+            ) : <p className="profile-empty-location">No family profiles have been added.</p>}
+            {familyEditorOpen && (
+              <form className="location-editor family-profile-form" onSubmit={saveFamilyProfile}>
+                <div className="location-editor-heading">
+                  <span className="location-editor-icon"><Users className="icon" /></span>
+                  <div>
+                    <h3>{editingFamilyProfileId === null ? 'Add a family member' : 'Edit family profile'}</h3>
+                    <p>Do not add medical details, prescriptions, or records here.</p>
+                  </div>
+                </div>
+                <div className="profile-input-grid">
+                  <label>
+                    Name
+                    <input
+                      required
+                      minLength={2}
+                      maxLength={120}
+                      autoComplete="off"
+                      value={familyForm.displayName}
+                      onChange={(event) => setFamilyForm({ ...familyForm, displayName: event.target.value })}
+                    />
+                  </label>
+                  <label>
+                    Relationship
+                    <input
+                      required
+                      maxLength={40}
+                      placeholder="For example, parent or child"
+                      value={familyForm.relationship}
+                      onChange={(event) => setFamilyForm({ ...familyForm, relationship: event.target.value })}
+                    />
+                  </label>
+                  <label>
+                    Profile authorization
+                    <select
+                      value={familyForm.memberType}
+                      disabled={editingFamilyProfileId !== null}
+                      onChange={(event) => setFamilyForm({
+                        ...familyForm,
+                        memberType: event.target.value as FamilyProfileForm['memberType'],
+                        authorizationConfirmed: false,
+                      })}
+                    >
+                      <option value="adult">Adult — member consent</option>
+                      <option value="minor">Minor — guardian authorization</option>
+                    </select>
+                  </label>
+                </div>
+                {editingFamilyProfileId === null && (
+                  <label className="family-authorization-check">
+                    <input
+                      type="checkbox"
+                      required
+                      checked={familyForm.authorizationConfirmed}
+                      onChange={(event) => setFamilyForm({ ...familyForm, authorizationConfirmed: event.target.checked })}
+                    />
+                    <span>
+                      {familyForm.memberType === 'adult'
+                        ? customerText(settings.language, 'family.adultConsent')
+                        : customerText(settings.language, 'family.guardianAuthorization')}
+                    </span>
+                  </label>
+                )}
+                <div className="profile-address-actions">
+                  <button type="submit" className="accept-action" disabled={busy}>
+                    {busy ? 'Saving…' : editingFamilyProfileId === null ? 'Save authorized profile' : 'Save changes'}
+                  </button>
+                  <button type="button" className="text-action" onClick={() => setFamilyEditorOpen(false)}>Cancel</button>
+                </div>
+              </form>
+            )}
+          </section>
+          <form className="profile-edit-card customer-settings-card" onSubmit={saveCustomerSettings}>
+            <div className="profile-edit-heading">
+              <span className="location-editor-icon"><User className="icon" /></span>
+              <div>
+                <h2>{customerText(settings.language, 'settings.title')}</h2>
+                <p>{customerText(settings.language, 'settings.description')}</p>
+              </div>
+            </div>
+            <div className="customer-settings-grid">
+              <label>
+                {customerText(settings.language, 'settings.language')}
+                <select
+                  value={settingsForm.language}
+                  disabled={busy}
+                  onChange={(event) => setSettingsFormDraft({ ...settingsForm, language: event.target.value as CustomerLocale })}
+                >
+                  {supportedCustomerLocales.map((locale) => <option key={locale.code} value={locale.code}>{locale.name}</option>)}
+                </select>
+                <small>{customerText(settings.language, 'settings.languageStatus')}</small>
+              </label>
+              <label>
+                {customerText(settings.language, 'settings.theme')}
+                <select
+                  value={settingsForm.theme}
+                  disabled={busy}
+                  onChange={(event) => setSettingsFormDraft({ ...settingsForm, theme: event.target.value as CustomerSettings['theme'] })}
+                >
+                  <option value="system">System</option>
+                  <option value="light">Light</option>
+                  <option value="dark">Dark</option>
+                </select>
+              </label>
+              <label className="customer-text-scale-control">
+                {customerText(settings.language, 'settings.textSize')}
+                <input
+                  type="range"
+                  min="0.9"
+                  max="1.2"
+                  step="0.05"
+                  value={settingsForm.textScale}
+                  disabled={busy}
+                  onChange={(event) => setSettingsFormDraft({ ...settingsForm, textScale: Number(event.target.value) })}
+                />
+                <output>{Math.round(settingsForm.textScale * 100)}%</output>
+              </label>
+            </div>
+            <label className="customer-preference-toggle">
+              <input
+                type="checkbox"
+                checked={settingsForm.orderNotificationsEnabled}
+                disabled={busy}
+                onChange={(event) => setSettingsFormDraft({ ...settingsForm, orderNotificationsEnabled: event.target.checked })}
+              />
+              <span>{customerText(settings.language, 'settings.orderNotifications')}</span>
+            </label>
+            <label className="customer-preference-toggle">
+              <input
+                type="checkbox"
+                checked={settingsForm.medicineNotificationsEnabled}
+                disabled={busy}
+                onChange={(event) => setSettingsFormDraft({ ...settingsForm, medicineNotificationsEnabled: event.target.checked })}
+              />
+              <span>{customerText(settings.language, 'settings.medicineNotifications')}</span>
+            </label>
+            <button type="submit" className="accept-action" disabled={busy}>
+              {busy ? 'Saving…' : 'Save preferences'}
+            </button>
+          </form>
           {message && <p className="success-message" role="status">{message}</p>}
           {error && <p className="owner-form-error" role="alert">{error}</p>}
           <button type="button" className="profile-sign-out-button" onClick={onSignOut}><LogOut className="icon" /> Sign out</button>
@@ -2145,16 +3017,29 @@ function ProductDetailPage({
   const [productLoading, setProductLoading] = useState(true)
   const [productError, setProductError] = useState('')
   const [quantity, setQuantity] = useState(1)
-  const [reviews, setReviews] = useState<Array<{ id: number; rating: number; comment: string; createdAt: string; customerName: string }>>([])
+  const [reviews, setReviews] = useState<ProductReview[]>([])
   const [averageRating, setAverageRating] = useState(0)
   const [reviewCount, setReviewCount] = useState(0)
+  const [ratingDistribution, setRatingDistribution] = useState<Record<string, number>>({})
   const [canReview, setCanReview] = useState(false)
+  const [ownReview, setOwnReview] = useState<{ orderId: number | null; rating: number; comment: string } | null>(null)
   const [reviewRating, setReviewRating] = useState(5)
   const [reviewComment, setReviewComment] = useState('')
   const [reviewError, setReviewError] = useState('')
   const [reviewMessage, setReviewMessage] = useState('')
   const [reviewSaving, setReviewSaving] = useState(false)
   const [cartActionError, setCartActionError] = useState('')
+  const [stockAlertSaving, setStockAlertSaving] = useState(false)
+  const [stockAlertMessage, setStockAlertMessage] = useState('')
+  const [refillReminderDate, setRefillReminderDate] = useState(() => {
+    const date = new Date()
+    date.setDate(date.getDate() + 30)
+    return date.toISOString().slice(0, 10)
+  })
+  const [refillIntervalDays, setRefillIntervalDays] = useState(30)
+  const [refillSaving, setRefillSaving] = useState(false)
+  const [refillMessage, setRefillMessage] = useState('')
+  const [today] = useState(() => new Date().toISOString().slice(0, 10))
 
   useEffect(() => {
     let cancelled = false
@@ -2205,20 +3090,24 @@ function ProductDetailPage({
     const loadReviews = async () => {
       if (!Number.isSafeInteger(productId) || productId < 1) return
       try {
-        const [reviewsResponse, ordersResponse] = await Promise.all([
+        const [reviewsResponse, eligibilityResponse] = await Promise.all([
           fetch(apiUrl(`/api/catalog/medicines/${productId}/reviews`)),
-          authenticatedApiFetch('/api/customer/orders', session.token),
+          authenticatedApiFetch(`/api/customer/medicines/${productId}/review-eligibility`, session.token),
         ])
-        const [reviewResult, ordersResult] = await Promise.all([reviewsResponse.json(), ordersResponse.json()])
+        const [reviewResult, eligibilityResult] = await Promise.all([reviewsResponse.json(), eligibilityResponse.json()])
         if (!reviewsResponse.ok) throw new Error(reviewResult.error || 'Could not load product reviews.')
-        if (!ordersResponse.ok) throw new Error(ordersResult.error || 'Could not check your delivered orders.')
+        if (!eligibilityResponse.ok) throw new Error(eligibilityResult.error || 'Could not check your delivered orders.')
         if (cancelled) return
         setReviews(reviewResult.reviews)
         setAverageRating(reviewResult.rating)
         setReviewCount(reviewResult.reviewCount)
-        setCanReview((ordersResult as CustomerOrder[]).some((order) =>
-          order.status === 'delivered' && order.items.some((item) => item.medicineId === productId),
-        ))
+        setRatingDistribution(reviewResult.ratingDistribution ?? {})
+        setCanReview(eligibilityResult.eligible)
+        setOwnReview(eligibilityResult.review)
+        if (eligibilityResult.review) {
+          setReviewRating(eligibilityResult.review.rating)
+          setReviewComment(eligibilityResult.review.comment)
+        }
         setReviewError('')
       } catch (requestError) {
         if (!cancelled) setReviewError(requestError instanceof Error ? requestError.message : 'Could not load product reviews.')
@@ -2244,8 +3133,10 @@ function ProductDetailPage({
       })
       const result = await response.json()
       if (!response.ok) throw new Error(result.error || 'Could not save your review.')
-      setReviewComment('')
-      setReviewMessage('Thanks — your verified-purchase review was saved.')
+      setOwnReview({ orderId: result.orderId, rating: result.rating, comment: result.comment })
+      setReviewRating(result.rating)
+      setReviewComment(result.comment)
+      setReviewMessage(ownReview ? 'Your verified-purchase review was updated.' : 'Thanks — your verified-purchase review was saved.')
       onReviewsChanged()
       const reviewsResponse = await fetch(apiUrl(`/api/catalog/medicines/${product.id}/reviews`))
       const reviewsResult = await reviewsResponse.json()
@@ -2253,6 +3144,7 @@ function ProductDetailPage({
       setReviews(reviewsResult.reviews)
       setAverageRating(reviewsResult.rating)
       setReviewCount(reviewsResult.reviewCount)
+      setRatingDistribution(reviewsResult.ratingDistribution ?? {})
     } catch (requestError) {
       setReviewError(requestError instanceof Error ? requestError.message : 'Could not save your review.')
     } finally {
@@ -2268,6 +3160,53 @@ function ProductDetailPage({
       return
     }
     navigate(buyNow ? '/checkout' : '/cart')
+  }
+
+  const saveStockAlert = async () => {
+    if (!product) return
+    setStockAlertSaving(true)
+    setStockAlertMessage('')
+    setCartActionError('')
+    try {
+      const response = await authenticatedApiFetch('/api/me/stock-alerts', session.token, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ medicineId: product.id }),
+      })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.error || 'Could not save the stock alert.')
+      setStockAlertMessage('Stock alert saved. We will notify you once this medicine is available. You can cancel it from your profile.')
+    } catch (requestError) {
+      setCartActionError(requestError instanceof Error ? requestError.message : 'Could not save the stock alert.')
+    } finally {
+      setStockAlertSaving(false)
+    }
+  }
+
+  const saveRefillReminder = async () => {
+    if (!product) return
+    setRefillSaving(true)
+    setRefillMessage('')
+    setCartActionError('')
+    try {
+      const response = await authenticatedApiFetch('/api/me/reminders', session.token, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          medicineId: product.id,
+          pharmacyId: product.pharmacyId,
+          nextReminderDate: refillReminderDate,
+          intervalDays: refillIntervalDays,
+        }),
+      })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.error || 'Could not save the refill reminder.')
+      setRefillMessage('Refill reminder saved. It provides an opt-in reminder only and never places an order.')
+    } catch (requestError) {
+      setCartActionError(requestError instanceof Error ? requestError.message : 'Could not save the refill reminder.')
+    } finally {
+      setRefillSaving(false)
+    }
   }
 
   if (productLoading) {
@@ -2337,15 +3276,37 @@ function ProductDetailPage({
         </div>
 
         {!product.available && (
-          <p className="owner-form-error" role="status">
-            {product.availabilityReason === 'expired' || product.availabilityReason === 'expired_batches'
-              ? 'Unavailable: expired medicine stock is excluded from sellable inventory.'
-              : product.availabilityReason === 'inactive'
-                ? 'Unavailable: this pharmacy listing is inactive.'
-                : 'Currently out of stock.'}
-          </p>
+          <>
+            <p className="owner-form-error" role="status">
+              {product.availabilityReason === 'expired' || product.availabilityReason === 'expired_batches'
+                ? 'Unavailable: expired medicine stock is excluded from sellable inventory.'
+                : product.availabilityReason === 'inactive'
+                  ? 'Unavailable: this pharmacy listing is inactive.'
+                  : 'Currently out of stock.'}
+            </p>
+            <button type="button" className="primary-cta secondary-cta" disabled={stockAlertSaving} onClick={() => void saveStockAlert()}>
+              {stockAlertSaving ? 'Saving stock alert…' : 'Notify me when back in stock'}
+            </button>
+            {stockAlertMessage && <p className="verification-success" role="status">{stockAlertMessage}</p>}
+          </>
         )}
         {product.warnings?.map((warning) => <p className="compare-location-notice" key={warning} role="note">{warning}</p>)}
+        <section className="profile-edit-card refill-reminder-card" aria-label="Refill reminder">
+          <div className="profile-edit-heading">
+            <span className="location-editor-icon"><BellRing className="icon" /></span>
+            <div><h3>Refill reminder</h3><p>Set a personal reminder. This will not order medicine or provide dosing advice.</p></div>
+          </div>
+          <div className="profile-input-grid">
+            <label>First reminder date<input type="date" value={refillReminderDate} min={today} onChange={(event) => setRefillReminderDate(event.target.value)} /></label>
+            <label>Repeat every<select value={refillIntervalDays} onChange={(event) => setRefillIntervalDays(Number(event.target.value))}>
+              {[7, 14, 30, 60, 90, 180, 365].map((days) => <option key={days} value={days}>{days} day(s)</option>)}
+            </select></label>
+          </div>
+          <button type="button" className="primary-cta secondary-cta" disabled={refillSaving} onClick={() => void saveRefillReminder()}>
+            {refillSaving ? 'Saving reminder…' : 'Save refill reminder'}
+          </button>
+          {refillMessage && <p className="verification-success" role="status">{refillMessage}</p>}
+        </section>
         <div className="description-block">
           <div className="section-header compact">
             <h3>Description</h3>
@@ -2372,6 +3333,21 @@ function ProductDetailPage({
         <section className="product-review-section">
           <div className="product-review-product"><img src={product.image} alt="" /><div><strong>{product.name}</strong><span>{product.pharmacyName}</span></div><span className={canReview ? 'order-status-pill delivered' : 'order-status-pill pending'}>{canReview ? 'Delivered' : 'Not delivered'}</span></div>
           <header className="product-review-heading"><div><h3>Customer reviews</h3><p>{reviewCount ? `${averageRating.toFixed(1)} average · ${reviewCount} verified reviews` : 'Be the first to share a verified-purchase review.'}</p></div><button type="button" onClick={() => navigate(`/product/${product.id}/reviews`)}>See all</button></header>
+          <div className="rating-distribution" aria-label="Public rating distribution">
+            {[5, 4, 3, 2, 1].map((stars) => {
+              const count = ratingDistribution[String(stars)] ?? 0
+              const percentage = reviewCount ? (count / reviewCount) * 100 : 0
+              return (
+                <div key={stars} className="rating-distribution-row">
+                  <span>{stars} <Star className="star-icon" /></span>
+                  <div role="progressbar" aria-label={`${stars}-star reviews`} aria-valuenow={count} aria-valuemin={0} aria-valuemax={reviewCount}>
+                    <i style={{ width: `${percentage}%` }} />
+                  </div>
+                  <small>{count}</small>
+                </div>
+              )
+            })}
+          </div>
           {reviewError && <p className="owner-form-error" role="alert">{reviewError}</p>}
           {reviewMessage && <p className="success-message" role="status">{reviewMessage}</p>}
           {canReview ? (
@@ -2381,12 +3357,13 @@ function ProductDetailPage({
                 <button type="button" key={rating} aria-label={`Rate ${rating} out of 5 stars`} aria-pressed={reviewRating === rating} data-filled={reviewRating >= rating} onClick={() => setReviewRating(rating)}><Star className="star-icon" /></button>
               ))}</div>
               <textarea rows={3} maxLength={500} placeholder="Share a helpful comment (optional)" value={reviewComment} onChange={(event) => setReviewComment(event.target.value)} />
-              <button type="submit" className="accept-action" disabled={reviewSaving}>{reviewSaving ? 'Saving…' : 'Post review'}</button>
+              <button type="submit" className="accept-action" disabled={reviewSaving}>{reviewSaving ? 'Saving…' : ownReview ? 'Update review' : 'Post review'}</button>
             </form>
           ) : <p className="review-eligibility-note">Reviews are available after this medicine is delivered in one of your orders.</p>}
           <div className="product-review-list">{reviews.map((review) => (
             <article className="product-review-card" key={review.id}>
               <div><strong>{review.customerName}</strong><span>{new Date(review.createdAt).toLocaleDateString()}</span></div>
+              {review.verifiedPurchase && <span className="verified-review-badge">Verified purchase</span>}
               <p>{Array.from({ length: review.rating }, () => '★').join('')}</p>
               {review.comment && <small>{review.comment}</small>}
             </article>
@@ -2635,13 +3612,15 @@ function CheckoutPage({
     setError('')
     try {
       if (!activeQuote) throw new Error('Request a confirmed quote before placing your order.')
+      const idempotencyKey = getOrderIdempotencyKey(session.user.id, cart, paymentMethod)
+      const requestBody = {
+        ...checkoutPayload(),
+        quoteId: activeQuote.quoteId,
+      }
       const response = await authenticatedApiFetch('/api/orders', session.token, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          ...checkoutPayload(),
-          quoteId: activeQuote.quoteId,
-        }),
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey },
+        body: JSON.stringify(requestBody),
       })
       const result = await response.json()
       if (!response.ok) {
@@ -2654,10 +3633,9 @@ function CheckoutPage({
         }
         throw new Error(result.error || 'Could not place your order.')
       }
-      const order = result as CustomerOrder
-      localStorage.setItem(`pharma-plus-delivery-otp-${session.user.id}-${order.id}`, order.deliveryOtp ?? '')
+      clearOrderIdempotencyKey(session.user.id, cart, paymentMethod, idempotencyKey)
       onClearCart()
-      navigate(`/orders/${order.id}`)
+      navigate(`/orders/${(result as CustomerOrder).id}`)
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : 'Could not place your order.')
     } finally {
@@ -3158,6 +4136,11 @@ function DashboardPage({
 }) {
   const { section, orderId } = useParams()
   const navigate = useNavigate()
+  const { unreadCount: notificationCount, error: notificationError } = useUnreadNotificationCount(
+    '/api/owner/notifications',
+    ownerSession.token,
+    ownerApiFetch,
+  )
   const [fontScale, setFontScale] = useState(() => {
     const saved = Number(localStorage.getItem(`pharma-plus-owner-font-${ownerSession.user.id}`))
     return Number.isFinite(saved) && saved >= 0.9 && saved <= 1.2 ? saved : 1
@@ -3167,6 +4150,7 @@ function DashboardPage({
     home: `Welcome, ${ownerSession.user.fullName}`,
     orders: 'Orders',
     prescriptions: 'Prescription review',
+    notifications: 'Notifications',
     medicines: 'Medicines',
     delivery: 'Delivery',
     verification: 'Pharmacy verification',
@@ -3191,8 +4175,12 @@ function DashboardPage({
                 to={label === 'Home' ? '/dashboard' : `/dashboard/${label.toLowerCase()}`}
                 className={({ isActive }) => (isActive ? 'sidebar-item active' : 'sidebar-item')}
               >
-                <Icon className="icon" />
-                <span>{label}</span>
+                {({ isActive }) => (
+                  <>
+                    <NavigationItemIcon icon={Icon} active={isActive} layoutId="owner-navigation-active" />
+                    <span className="nav-label">{label}</span>
+                  </>
+                )}
               </NavLink>
             ))}
           </nav>
@@ -3211,11 +4199,15 @@ function DashboardPage({
                 setFontScale(nextScale)
                 localStorage.setItem(`pharma-plus-owner-font-${ownerSession.user.id}`, String(nextScale))
               }} /><strong>{Math.round(fontScale * 100)}%</strong></label>
-              <button className="icon-button light" aria-label="View order notifications" onClick={() => navigate('/dashboard/orders')}><BellRing className="icon" /></button>
+              <button className="icon-button light notification-button" aria-label={`View notifications${notificationCount ? `, ${notificationCount} unread` : ''}`} onClick={() => navigate('/dashboard/notifications')}>
+                <BellRing className="icon" />
+                {notificationCount > 0 && <span className="notification-badge">{notificationCount > 9 ? '9+' : notificationCount}</span>}
+              </button>
               <span className="owner-email">{ownerSession.user.fullName} · {ownerSession.user.email}</span>
               <button className="quiet-action owner-logout" onClick={onSignOut}><LogOut className="icon" /> Sign out</button>
             </div>
           </header>
+          {notificationError && <p className="owner-form-error notification-poll-error" role="status">{notificationError}</p>}
 
           {activeSection === 'home' && (
             <PharmacyOverviewScreen
@@ -3234,6 +4226,7 @@ function DashboardPage({
               <PharmacyOrdersScreen token={ownerSession.token} orderId={orderId} />
             </>
           )}
+          {activeSection === 'notifications' && <OrderNotificationsPage session={ownerSession} isOwner />}
           {activeSection === 'medicines' && <PharmacyMedicinesScreen onCatalogChange={onCatalogChange} token={ownerSession.token} />}
           {activeSection === 'verification' && <PharmacyVerificationScreen token={ownerSession.token} />}
         </main>
@@ -3448,7 +4441,7 @@ function PharmacyOverviewScreen({
   onOpenOrder: (id: number) => void
 }) {
   const [inventory, setInventory] = useState<InventoryRecord[]>([])
-  const [movements, setMovements] = useState<Array<{ id: number; type: string; quantityChange: number; note: string | null; createdAt: string; medicineName: string; sku: string | null }>>([])
+  const [movements, setMovements] = useState<StockMovement[]>([])
   const [orders, setOrders] = useState<CustomerOrder[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -3502,6 +4495,7 @@ function PharmacyOverviewScreen({
     session.user.pharmacyState,
     session.user.pharmacyPostalCode,
   ].filter(Boolean).join(', ')
+  const recentMovementSummaries = summarizeRecentStockMovements(movements)
 
   return (
     <section className="pharmacy-overview">
@@ -3579,13 +4573,23 @@ function PharmacyOverviewScreen({
         </div>
       </section>
       <section className="stock-movement-panel">
-        <div className="pharmacy-page-heading"><div><h3>Recent stock activity</h3><p>Receipts, adjustments and order deductions.</p></div></div>
+        <div className="pharmacy-page-heading"><div><h3>Recent stock activity</h3><p>Stock is deducted when orders are placed; quick manual edits are grouped.</p></div></div>
         {loading ? <p className="inventory-note">Loading movement history…</p> : movements.length ? (
-          <div className="stock-movement-list">{movements.slice(0, 12).map((movement) => (
+          <div className="stock-movement-list">{recentMovementSummaries.slice(0, 6).map((movement) => (
             <article key={movement.id}>
               <span className={movement.quantityChange < 0 ? 'stock-movement-icon decrease' : 'stock-movement-icon'}>{movement.quantityChange < 0 ? <Minus className="icon" /> : <Plus className="icon" />}</span>
-              <div><strong>{movement.medicineName}</strong><small>{movement.note || movement.type} · {new Date(movement.createdAt).toLocaleString()}</small></div>
-              <b className={movement.quantityChange < 0 ? 'decrease' : ''}>{movement.quantityChange > 0 ? '+' : ''}{movement.quantityChange}</b>
+              <div>
+                <strong>{movement.medicineName}</strong>
+                <small>
+                  {movement.type === 'adjustment' ? 'Manual stock adjustment' : movement.note || movement.type}
+                  {movement.changeCount > 1 ? ` · ${movement.changeCount} edits` : ''}
+                  {' · '}{new Date(movement.createdAt).toLocaleString('en-IN', { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' })}
+                </small>
+              </div>
+              <b className={movement.quantityChange < 0 ? 'decrease' : ''}>
+                {movement.quantityChange > 0 ? '+' : ''}{movement.quantityChange}
+                {movement.changeCount > 1 ? ' net' : ''}
+              </b>
             </article>
           ))}</div>
         ) : <div className="empty-state-card compact-empty">Stock changes will be tracked here.</div>}
@@ -3609,8 +4613,10 @@ function PharmacyOverviewScreen({
 
 function PharmacyOrdersScreen({ token, orderId }: { token: string; orderId?: string }) {
   const navigate = useNavigate()
+  const deliveryCodeInputs = useRef<Record<number, Array<HTMLInputElement | null>>>({})
   const [orders, setOrders] = useState<CustomerOrder[]>([])
   const [otpInputs, setOtpInputs] = useState<Record<number, string>>({})
+  const [transitionNotes, setTransitionNotes] = useState<Record<number, string>>({})
   const [loading, setLoading] = useState(true)
   const [savingId, setSavingId] = useState<number | null>(null)
   const [error, setError] = useState('')
@@ -3624,39 +4630,66 @@ function PharmacyOrdersScreen({ token, orderId }: { token: string; orderId?: str
       if (!response.ok) throw new Error(result.error || 'Could not load pharmacy orders.')
       setOrders(result as CustomerOrder[])
       setError('')
-    } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : 'Could not load pharmacy orders.')
+      return true
+    } catch {
+      setError('Could not refresh pharmacy orders. Showing the last known statuses; retrying automatically.')
+      return false
     } finally {
       setLoading(false)
     }
   }, [token])
 
-  useEffect(() => {
-    // Keep pharmacy fulfillment status synchronized with new customer orders.
-    // oxlint-disable-next-line react/set-state-in-effect
-    void loadOrders()
-    const timer = window.setInterval(() => void loadOrders(), 15000)
-    return () => window.clearInterval(timer)
-  }, [loadOrders])
+  useRetryingPolling(loadOrders)
 
   const updateStatus = async (order: CustomerOrder, status: string) => {
     setSavingId(order.id)
     setError('')
     try {
-      const response = await ownerApiFetch(`/api/owner/orders/${order.id}/status`, token, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ status, otp: otpInputs[order.id] ?? '' }),
-      })
+      const declining = status === 'declined'
+      const verifyingDelivery = status === 'delivered'
+      const response = await ownerApiFetch(
+        `/api/owner/orders/${order.id}/${declining ? 'decline' : verifyingDelivery ? 'verify-delivery' : 'transition'}`,
+        token,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(declining ? {
+            reason: transitionNotes[order.id] ?? '',
+          } : verifyingDelivery ? {
+            code: (otpInputs[order.id] ?? '').replace(/\D/g, ''),
+          } : {
+            status,
+            expectedStatus: order.status,
+            note: transitionNotes[order.id] ?? '',
+          }),
+        },
+      )
       const result = await response.json()
       if (!response.ok) throw new Error(result.error || 'Could not update order status.')
       setOrders((current) => current.map((entry) => entry.id === order.id ? result as CustomerOrder : entry))
       setOtpInputs((current) => ({ ...current, [order.id]: '' }))
+      setTransitionNotes((current) => ({ ...current, [order.id]: '' }))
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : 'Could not update order status.')
     } finally {
       setSavingId(null)
     }
+  }
+
+  const updateDeliveryCodeDigit = (orderIdValue: number, index: number, rawValue: string) => {
+    const digits = rawValue.replace(/\D/g, '')
+    setOtpInputs((current) => {
+      const next = (current[orderIdValue] ?? '').padEnd(6, ' ').slice(0, 6).split('')
+      if (digits.length > 1) {
+        for (let offset = 0; offset < digits.length && index + offset < 6; offset += 1) {
+          next[index + offset] = digits[offset]
+        }
+      } else {
+        next[index] = digits || ' '
+      }
+      return { ...current, [orderIdValue]: next.join('') }
+    })
+    if (digits.length) deliveryCodeInputs.current[orderIdValue]?.[Math.min(index + digits.length, 5)]?.focus()
   }
 
   const visibleOrders = orderId
@@ -3678,7 +4711,7 @@ function PharmacyOrdersScreen({ token, orderId }: { token: string; orderId?: str
         <div className="owner-order-controls">
           <label><Search className="icon" /><input type="search" placeholder="Search by order ID or customer…" value={search} onChange={(event) => setSearch(event.target.value)} /></label>
           <div className="order-filter-tabs" role="group" aria-label="Filter pharmacy orders">
-            {['all', 'pending', 'accepted', 'preparing', 'out_for_delivery', 'delivered'].map((status) => <button type="button" className={statusFilter === status ? 'active' : ''} key={status} onClick={() => setStatusFilter(status)}>{status === 'all' ? 'All' : status === 'preparing' ? 'Preparing' : status === 'out_for_delivery' ? 'Out for delivery' : status[0].toUpperCase() + status.slice(1)}</button>)}
+            {['all', 'pending', 'accepted', 'preparing', 'ready', 'out_for_delivery', 'delivered'].map((status) => <button type="button" className={statusFilter === status ? 'active' : ''} key={status} onClick={() => setStatusFilter(status)}>{status === 'all' ? 'All' : orderStatusLabel[status] ?? status}</button>)}
           </div>
         </div>
       )}
@@ -3692,10 +4725,55 @@ function PharmacyOrdersScreen({ token, orderId }: { token: string; orderId?: str
             <div className="owner-order-items">{order.items.map((item) => <div key={`${order.id}-${item.medicineId}`}><span>{item.name} × {formatOrderItemQuantity(item)}{item.prescriptionRequired && <small> · Prescription #{item.prescriptionId} approved</small>}</span><strong>₹{item.lineTotal.toLocaleString('en-IN')}</strong></div>)}</div>
             <p className="customer-order-address"><MapPin className="icon" /> {order.fulfillmentMethod === 'pickup' ? 'Pharmacy pickup' : formatOrderLocation(order)}</p>
             <OrderTimeline order={order} />
-            {order.status === 'pending' && <div className="owner-order-actions"><button type="button" className="decline-action" disabled={savingId === order.id} onClick={() => void updateStatus(order, 'declined')}>Decline</button><button type="button" className="accept-action" disabled={savingId === order.id} onClick={() => void updateStatus(order, 'accepted')}>{savingId === order.id ? 'Saving…' : 'Accept order'}</button></div>}
-            {order.status === 'accepted' && <button type="button" className="accept-action owner-order-primary" disabled={savingId === order.id} onClick={() => void updateStatus(order, 'preparing')}>{savingId === order.id ? 'Saving…' : 'Mark packed'}</button>}
-            {order.status === 'preparing' && <button type="button" className="accept-action owner-order-primary" disabled={savingId === order.id} onClick={() => void updateStatus(order, 'out_for_delivery')}>{savingId === order.id ? 'Saving…' : 'Start delivery'}</button>}
-            {order.status === 'out_for_delivery' && <div className="owner-otp-entry"><label>Customer delivery code<input inputMode="numeric" autoComplete="one-time-code" maxLength={6} placeholder="6-digit code" value={otpInputs[order.id] ?? ''} onChange={(event) => setOtpInputs((current) => ({ ...current, [order.id]: event.target.value.replace(/\D/g, '').slice(0, 6) }))} /></label><button type="button" className="accept-action" disabled={savingId === order.id || (otpInputs[order.id] ?? '').length !== 6} onClick={() => void updateStatus(order, 'delivered')}>{savingId === order.id ? 'Verifying…' : 'Verify & mark delivered'}</button></div>}
+            {['pending', 'accepted', 'preparing', 'ready', 'out_for_delivery'].includes(order.status) && (
+              <label className="owner-transition-note">
+                {order.status === 'pending' ? 'Decline reason (required to decline)' : 'Optional update for the customer'}
+                <textarea
+                  maxLength={500}
+                  rows={2}
+                  value={transitionNotes[order.id] ?? ''}
+                  onChange={(event) => setTransitionNotes((current) => ({ ...current, [order.id]: event.target.value }))}
+                />
+              </label>
+            )}
+            {order.status === 'pending' && <div className="owner-order-actions"><button type="button" className="decline-action" disabled={savingId === order.id || !(transitionNotes[order.id] ?? '').trim()} onClick={() => void updateStatus(order, 'declined')}>Decline</button><button type="button" className="accept-action" disabled={savingId === order.id} onClick={() => void updateStatus(order, 'accepted')}>{savingId === order.id ? 'Saving…' : 'Accept order'}</button></div>}
+            {order.status === 'accepted' && <button type="button" className="accept-action owner-order-primary" disabled={savingId === order.id} onClick={() => void updateStatus(order, 'preparing')}>{savingId === order.id ? 'Saving…' : 'Start preparation'}</button>}
+            {order.status === 'preparing' && <button type="button" className="accept-action owner-order-primary" disabled={savingId === order.id} onClick={() => void updateStatus(order, 'ready')}>{savingId === order.id ? 'Saving…' : 'Mark ready for dispatch'}</button>}
+            {order.status === 'ready' && <button type="button" className="accept-action owner-order-primary" disabled={savingId === order.id} onClick={() => void updateStatus(order, 'out_for_delivery')}>{savingId === order.id ? 'Saving…' : 'Start delivery'}</button>}
+            {order.status === 'out_for_delivery' && <div className="owner-otp-entry">
+              <fieldset className="delivery-code-input-group">
+                <legend>Customer delivery code</legend>
+                <div role="group" aria-label="Six-digit customer delivery code">
+                  {Array.from({ length: 6 }, (_, index) => (
+                    <input
+                      key={index}
+                      ref={(element) => {
+                        deliveryCodeInputs.current[order.id] ??= []
+                        deliveryCodeInputs.current[order.id][index] = element
+                      }}
+                      aria-label={`Delivery code digit ${index + 1}`}
+                      inputMode="numeric"
+                      autoComplete={index === 0 ? 'one-time-code' : 'off'}
+                      maxLength={index === 0 ? 6 : 1}
+                      value={(otpInputs[order.id] ?? '')[index]?.trim() ?? ''}
+                      onChange={(event) => updateDeliveryCodeDigit(order.id, index, event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Backspace' && !(otpInputs[order.id] ?? '')[index]?.trim() && index > 0) {
+                          deliveryCodeInputs.current[order.id]?.[index - 1]?.focus()
+                        }
+                      }}
+                      onPaste={(event) => {
+                        if (index === 0) {
+                          event.preventDefault()
+                          updateDeliveryCodeDigit(order.id, 0, event.clipboardData.getData('text').slice(0, 6))
+                        }
+                      }}
+                    />
+                  ))}
+                </div>
+              </fieldset>
+              <button type="button" className="accept-action" disabled={savingId === order.id || (otpInputs[order.id] ?? '').replace(/\D/g, '').length !== 6} onClick={() => void updateStatus(order, 'delivered')}>{savingId === order.id ? 'Verifying…' : 'Verify & mark delivered'}</button>
+            </div>}
           </article>
         ))}</div>
       ) : <div className="empty-state-card orders-empty-state"><span className="empty-state-icon-wrap"><ShoppingBag className="icon" /></span><h2>{orderId ? 'Order not found' : 'No orders yet'}</h2><p>{orderId ? 'This order is not part of your pharmacy account.' : 'New customer orders will appear here and update automatically.'}</p></div>}
@@ -3910,8 +4988,9 @@ function PrescriptionReviewCard({
 
 function PharmacyMedicinesScreen({ onCatalogChange, token }: { onCatalogChange: () => void; token: string }) {
   const [inventory, setInventory] = useState<InventoryRecord[]>([])
-  const [movements, setMovements] = useState<Array<{ id: number; type: string; quantityChange: number; note: string | null; createdAt: string; medicineName: string; sku: string | null }>>([])
+  const [movements, setMovements] = useState<StockMovement[]>([])
   const [form, setForm] = useState<MedicineForm | null>(null)
+  const [selectedImage, setSelectedImage] = useState<{ file: File; previewUrl: string } | null>(null)
   const [editingId, setEditingId] = useState<number | null>(null)
   const [stepError, setStepError] = useState('')
   const [inventorySearch, setInventorySearch] = useState('')
@@ -3919,6 +4998,13 @@ function PharmacyMedicinesScreen({ onCatalogChange, token }: { onCatalogChange: 
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
+  const imagePreview = selectedImage?.previewUrl || (form?.imageUrl ? productImageSource(form.imageUrl) : '')
+
+  useEffect(() => {
+    return () => {
+      if (selectedImage) URL.revokeObjectURL(selectedImage.previewUrl)
+    }
+  }, [selectedImage])
 
   const loadInventory = useCallback(async () => {
     try {
@@ -3947,6 +5033,7 @@ function PharmacyMedicinesScreen({ onCatalogChange, token }: { onCatalogChange: 
 
   const startEdit = (item: InventoryRecord) => {
     setEditingId(item.id)
+    setSelectedImage(null)
     setStepError('')
     setForm({
       name: item.name,
@@ -3973,6 +5060,20 @@ function PharmacyMedicinesScreen({ onCatalogChange, token }: { onCatalogChange: 
     })
   }
 
+  const handleImageSelection = (file: File | undefined) => {
+    if (!file) return
+    if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type)) {
+      setStepError('Choose a JPEG, PNG, or WebP image.')
+      return
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      setStepError('Choose an image that is 5 MB or smaller.')
+      return
+    }
+    setSelectedImage({ file, previewUrl: URL.createObjectURL(file) })
+    setStepError('')
+  }
+
   const saveMedicine = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (!form) return
@@ -3995,12 +5096,26 @@ function PharmacyMedicinesScreen({ onCatalogChange, token }: { onCatalogChange: 
     setSaving(true)
     setError('')
     try {
+      let imageUrl = form.imageUrl.trim() || null
+      if (selectedImage) {
+        const uploadResponse = await ownerApiFetch('/api/owner/product-images', token, {
+          method: 'POST',
+          headers: { 'Content-Type': selectedImage.file.type },
+          body: selectedImage.file,
+        })
+        const uploadResult = await uploadResponse.json() as { imageUrl?: string; error?: string }
+        if (!uploadResponse.ok || typeof uploadResult.imageUrl !== 'string') {
+          throw new Error(uploadResult.error || 'Could not upload the product image.')
+        }
+        imageUrl = uploadResult.imageUrl
+      }
       const response = await ownerApiFetch(editingId ? `/api/medicines/${editingId}` : '/api/medicines', token, {
         method: editingId ? 'PUT' : 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           ...form,
           packQuantity: Number(form.packQuantity),
+          imageUrl,
           price: Number(form.price),
           stock: Number(form.stock),
           reorderLevel: Number(form.reorderLevel),
@@ -4017,6 +5132,7 @@ function PharmacyMedicinesScreen({ onCatalogChange, token }: { onCatalogChange: 
       onCatalogChange()
       void loadInventory()
       setForm(null)
+      setSelectedImage(null)
       setEditingId(null)
       setStepError('')
     } catch (requestError) {
@@ -4079,6 +5195,7 @@ function PharmacyMedicinesScreen({ onCatalogChange, token }: { onCatalogChange: 
           className="accept-action"
           onClick={() => {
             setEditingId(null)
+            setSelectedImage(null)
             setStepError('')
             setForm(emptyMedicineForm())
           }}
@@ -4092,7 +5209,7 @@ function PharmacyMedicinesScreen({ onCatalogChange, token }: { onCatalogChange: 
           <section className="medicine-editor" role="dialog" aria-modal="true" aria-labelledby="medicine-editor-title">
             <header className="medicine-editor-header">
               <div className="medicine-editor-brand"><span className="medicine-editor-brand-icon"><Pill className="icon" /></span><span>INVENTORY STUDIO</span></div>
-              <button type="button" className="medicine-editor-close" aria-label="Close medicine editor" onClick={() => setForm(null)}><X className="icon" /></button>
+              <button type="button" className="medicine-editor-close" aria-label="Close medicine editor" onClick={() => { setForm(null); setSelectedImage(null) }}><X className="icon" /></button>
             </header>
             <form className="medicine-editor-form" onSubmit={saveMedicine}>
               <div className="medicine-editor-step-heading"><span>PRODUCT CATALOG</span><h4>Medicine information</h4></div>
@@ -4118,11 +5235,51 @@ function PharmacyMedicinesScreen({ onCatalogChange, token }: { onCatalogChange: 
                 <label>GST rate (%)<input type="number" min="0" max="100" step="0.01" value={form.gstRate} onChange={(event) => setForm({ ...form, gstRate: event.target.value })} /></label>
                 <label>HSN code<input placeholder="Optional" value={form.hsnCode} onChange={(event) => setForm({ ...form, hsnCode: event.target.value })} /></label>
                 <label className="medicine-field-wide">Product description<textarea rows={3} placeholder="Add helpful details about this product" value={form.description} onChange={(event) => setForm({ ...form, description: event.target.value })} /></label>
-                <label className="medicine-field-wide">Image URL<input type="url" placeholder="https://…" value={form.imageUrl} onChange={(event) => setForm({ ...form, imageUrl: event.target.value })} /></label>
+                <div className="medicine-field-wide medicine-image-picker">
+                  <div className="medicine-image-picker-heading">
+                    <strong>Product photo</strong>
+                    <small>Choose an image from this device. JPEG, PNG, or WebP up to 5 MB.</small>
+                  </div>
+                  <div className="medicine-image-picker-row">
+                    <div className="medicine-image-preview">
+                      {imagePreview
+                        ? <img src={imagePreview} alt={`Preview of ${form.name || 'medicine'}`} />
+                        : <Pill className="icon" aria-hidden="true" />}
+                    </div>
+                    <div className="medicine-image-picker-actions">
+                      <label className="medicine-image-select">
+                        <Camera className="icon" aria-hidden="true" />
+                        <span>{selectedImage ? 'Change photo' : form.imageUrl ? 'Replace photo' : 'Choose photo'}</span>
+                        <input
+                          type="file"
+                          accept="image/jpeg,image/png,image/webp"
+                          aria-label="Choose a product photo from this device"
+                          onChange={(event) => {
+                            handleImageSelection(event.currentTarget.files?.[0])
+                            event.currentTarget.value = ''
+                          }}
+                        />
+                      </label>
+                      {(selectedImage || form.imageUrl) && (
+                        <button
+                          type="button"
+                          className="medicine-image-remove"
+                          onClick={() => {
+                            setSelectedImage(null)
+                            setForm({ ...form, imageUrl: '' })
+                            setStepError('')
+                          }}
+                        >
+                          Remove photo
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </div>
                 <label className="medicine-prescription-toggle"><input type="checkbox" checked={form.prescriptionRequired} onChange={(event) => setForm({ ...form, prescriptionRequired: event.target.checked })} /><span><strong>Prescription required</strong><small>Mark this product as prescription-only.</small></span></label>
               </div>
               <footer className="medicine-editor-actions">
-                <button type="button" className="quiet-action" onClick={() => setForm(null)}>Cancel</button>
+                <button type="button" className="quiet-action" onClick={() => { setForm(null); setSelectedImage(null) }}>Cancel</button>
                 <button type="submit" className="accept-action" disabled={saving}>{saving ? 'Saving…' : editingId ? 'Save changes' : 'Add to inventory'}</button>
               </footer>
             </form>
@@ -4144,7 +5301,11 @@ function PharmacyMedicinesScreen({ onCatalogChange, token }: { onCatalogChange: 
       <div className="pharmacy-card-list">
         {visibleInventory.map((item) => (
           <article className="pharmacy-data-card inventory-card" key={item.id}>
-            <div className="inventory-product-icon"><Pill className="icon" /></div>
+            <div className="inventory-product-icon">
+              {item.imageUrl
+                ? <img src={productImageSource(item.imageUrl)} alt="" />
+                : <Pill className="icon" />}
+            </div>
             <div className="inventory-main">
               <div className="data-card-heading">
                 <div><h3>{item.name}</h3><p>{item.category} · {item.pack}{item.sku ? ` · ${item.sku}` : ''}</p></div>

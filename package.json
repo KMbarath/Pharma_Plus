@@ -8,6 +8,7 @@
     "api": "node --env-file-if-exists=.env server/index.mjs",
     "api:mobile": "node --env-file-if-exists=.env server/mobile-api.mjs",
     "db:setup": "node --env-file-if-exists=.env server/migrate.mjs",
+    "test:orders": "node --test server/orders.test.mjs",
     "mobile:cert": "node --env-file-if-exists=.env server/mobile-cert.mjs",
     "mobile:build": "node --env-file-if-exists=.env server/mobile-build.mjs",
     "build": "tsc -b && vite build",

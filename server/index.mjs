@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, createHash, randomBytes, randomInt, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto'
+import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto'
 import express from 'express'
 import pg from 'pg'
 import cors from 'cors'
@@ -9,6 +9,13 @@ import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import multer from 'multer'
+import { canTransitionOrderStatus, isOrderStatus } from './order-status.mjs'
+import {
+  createDeliveryCodeVerifier,
+  deriveDeliveryCode,
+  loadDeliveryCodeKeyRing,
+  verifyDeliveryCode,
+} from './delivery-code.mjs'
 
 const app = express()
 const port = Number(process.env.API_PORT || 3001)
@@ -23,6 +30,8 @@ const prescriptionStorageKey = process.env.PRESCRIPTION_STORAGE_KEY || ''
 const clamScanPath = process.env.CLAMSCAN_PATH || 'clamscan'
 const databaseHost = process.env.PGHOST || (process.platform === 'win32' ? '127.0.0.1' : '/tmp')
 const databaseUser = process.env.PGUSER || process.env.USER || process.env.USERNAME
+const deliveryCodeKeyRing = await loadDeliveryCodeKeyRing()
+const productImageDirectory = fileURLToPath(new URL('../uploads/products/', import.meta.url))
 const allowedOrigins = new Set([
   'https://localhost',
   'capacitor://localhost',
@@ -63,15 +72,65 @@ function parseUpiQrUpload(request, response, next) {
   })
 }
 
+class ApiError extends Error {
+  constructor(status, message, code = 'REQUEST_FAILED', details = {}) {
+    super(message)
+    this.status = status
+    this.code = code
+    this.details = details
+  }
+}
+
+async function rollbackTransaction(client) {
+  try {
+    await client.query('ROLLBACK')
+  } catch (error) {
+    console.error('Could not roll back a database transaction:', error)
+  }
+}
+
+function priceToCents(value) {
+  const price = typeof value === 'string' ? Number(value) : value
+  if (!Number.isFinite(price) || price < 0) return null
+  return Math.round(price * 100)
+}
+
 app.use(cors({
   origin(origin, callback) {
     if (!origin || allowedOrigins.has(origin)) return callback(null, true)
     return callback(new Error('This origin is not allowed to access the pharmacy API.'))
   },
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key'],
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
 }))
 app.use(express.json({ limit: '32kb' }))
+app.use('/api/uploads/products', express.static(productImageDirectory, {
+  fallthrough: false,
+  index: false,
+  maxAge: '1d',
+}))
+
+function productImageExtension(contentType, image) {
+  if (
+    contentType === 'image/jpeg' &&
+    image.length >= 3 &&
+    image[0] === 0xff &&
+    image[1] === 0xd8 &&
+    image[2] === 0xff
+  ) return 'jpg'
+  if (
+    contentType === 'image/png' &&
+    image.length >= 8 &&
+    image.subarray(0, 8).equals(Buffer.from('89504e470d0a1a0a', 'hex'))
+  ) return 'png'
+  if (
+    contentType === 'image/webp' &&
+    image.length >= 12 &&
+    image.toString('ascii', 0, 4) === 'RIFF' &&
+    image.toString('ascii', 8, 12) === 'WEBP'
+  ) return 'webp'
+  return null
+}
 
 function publicAccount(row) {
   return {
@@ -535,6 +594,367 @@ app.patch('/api/me/profile', requireCustomer, async (request, response, next) =>
   }
 })
 
+function customerSettingsRow(row) {
+  return {
+    language: row.language,
+    theme: row.theme,
+    textScale: Number(row.textScale),
+    orderNotificationsEnabled: row.orderNotificationsEnabled,
+    medicineNotificationsEnabled: row.medicineNotificationsEnabled,
+    updatedAt: row.updatedAt,
+  }
+}
+
+const customerSettingsSelect = `
+  SELECT language, theme, text_scale::float8 AS "textScale",
+    order_notifications_enabled AS "orderNotificationsEnabled",
+    medicine_notifications_enabled AS "medicineNotificationsEnabled",
+    updated_at AS "updatedAt"
+  FROM customer_settings WHERE user_account_id = $1
+`
+
+app.get('/api/me/settings', requireCustomer, async (request, response, next) => {
+  try {
+    await pool.query(
+      `INSERT INTO customer_settings (user_account_id) VALUES ($1)
+       ON CONFLICT (user_account_id) DO NOTHING`,
+      [request.user.id],
+    )
+    const result = await pool.query(customerSettingsSelect, [request.user.id])
+    if (!result.rowCount) return response.status(404).json({ error: 'Customer settings were not found.' })
+    response.json({ settings: customerSettingsRow(result.rows[0]) })
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.patch('/api/me/settings', requireCustomer, async (request, response, next) => {
+  const body = request.body ?? {}
+  const allowedFields = new Set([
+    'language',
+    'theme',
+    'textScale',
+    'orderNotificationsEnabled',
+    'medicineNotificationsEnabled',
+  ])
+  const unknownFields = Object.keys(body).filter((key) => !allowedFields.has(key))
+  if (unknownFields.length) return response.status(400).json({ error: 'One or more settings are not supported.' })
+  if (!Object.keys(body).length) return response.status(400).json({ error: 'Choose at least one setting to update.' })
+  if (Object.hasOwn(body, 'language') && body.language !== 'en') {
+    return response.status(400).json({ error: 'That language is not available yet.' })
+  }
+  if (Object.hasOwn(body, 'theme') && !['system', 'light', 'dark'].includes(body.theme)) {
+    return response.status(400).json({ error: 'Choose system, light, or dark theme.' })
+  }
+  if (
+    Object.hasOwn(body, 'textScale') &&
+    (typeof body.textScale !== 'number' || !Number.isFinite(body.textScale) || body.textScale < 0.9 || body.textScale > 1.2)
+  ) {
+    return response.status(400).json({ error: 'Text size must be between 90% and 120%.' })
+  }
+  for (const field of ['orderNotificationsEnabled', 'medicineNotificationsEnabled']) {
+    if (Object.hasOwn(body, field) && typeof body[field] !== 'boolean') {
+      return response.status(400).json({ error: `Choose whether ${field === 'orderNotificationsEnabled' ? 'order updates' : 'medicine alerts'} are enabled.` })
+    }
+  }
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO customer_settings
+         (user_account_id, language, theme, text_scale,
+          order_notifications_enabled, medicine_notifications_enabled)
+       VALUES ($1, COALESCE($2, 'en'), COALESCE($3, 'system'), COALESCE($4::numeric, 1),
+          COALESCE($5, true), COALESCE($6, true))
+       ON CONFLICT (user_account_id) DO UPDATE SET
+         language = COALESCE($2, customer_settings.language),
+         theme = COALESCE($3, customer_settings.theme),
+         text_scale = COALESCE($4::numeric, customer_settings.text_scale),
+         order_notifications_enabled = COALESCE($5, customer_settings.order_notifications_enabled),
+         medicine_notifications_enabled = COALESCE($6, customer_settings.medicine_notifications_enabled),
+         updated_at = now()
+       RETURNING language, theme, text_scale::float8 AS "textScale",
+         order_notifications_enabled AS "orderNotificationsEnabled",
+         medicine_notifications_enabled AS "medicineNotificationsEnabled",
+         updated_at AS "updatedAt"`,
+      [
+        request.user.id,
+        Object.hasOwn(body, 'language') ? body.language : null,
+        Object.hasOwn(body, 'theme') ? body.theme : null,
+        Object.hasOwn(body, 'textScale') ? body.textScale : null,
+        Object.hasOwn(body, 'orderNotificationsEnabled') ? body.orderNotificationsEnabled : null,
+        Object.hasOwn(body, 'medicineNotificationsEnabled') ? body.medicineNotificationsEnabled : null,
+      ],
+    )
+    response.json({ settings: customerSettingsRow(result.rows[0]) })
+  } catch (error) {
+    next(error)
+  }
+})
+
+function familyProfileStatus(row) {
+  if (row.removedAt) return 'removed'
+  if (row.authorizationRevokedAt) return 'revoked'
+  return 'active'
+}
+
+function familyProfileRow(row) {
+  return {
+    id: row.id,
+    displayName: row.displayName,
+    relationship: row.relationship,
+    memberType: row.memberType,
+    authorizationType: row.authorizationType,
+    authorizationVersion: row.authorizationVersion,
+    authorizationConfirmedAt: row.authorizationConfirmedAt,
+    authorizationRevokedAt: row.authorizationRevokedAt,
+    removedAt: row.removedAt,
+    status: familyProfileStatus(row),
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  }
+}
+
+const familyProfileSelect = `
+  SELECT id::int AS id, display_name AS "displayName", relationship,
+    member_type AS "memberType", authorization_type AS "authorizationType",
+    authorization_policy_version AS "authorizationVersion",
+    authorization_confirmed_at AS "authorizationConfirmedAt",
+    authorization_revoked_at AS "authorizationRevokedAt", removed_at AS "removedAt",
+    created_at AS "createdAt", updated_at AS "updatedAt"
+  FROM family_profiles
+`
+
+async function recordFamilyProfileEvent(client, profileId, actorUserId, action, details = {}) {
+  await client.query(
+    `INSERT INTO family_profile_audit_events
+       (family_profile_id, actor_user_id, action, details)
+     VALUES ($1, $2, $3, $4::jsonb)`,
+    [profileId, actorUserId, action, JSON.stringify(details)],
+  )
+}
+
+app.get('/api/me/family', requireCustomer, async (request, response, next) => {
+  try {
+    const result = await pool.query(
+      `${familyProfileSelect}
+       WHERE owner_user_id = $1
+       ORDER BY created_at, id`,
+      [request.user.id],
+    )
+    response.json({ familyProfiles: result.rows.map(familyProfileRow) })
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.post('/api/me/family', requireCustomer, async (request, response, next) => {
+  const body = request.body ?? {}
+  const allowedFields = new Set(['displayName', 'relationship', 'memberType', 'authorizationConfirmed'])
+  if (Object.keys(body).some((key) => !allowedFields.has(key))) {
+    return response.status(400).json({ error: 'Only a name, relationship, member type, and authorization confirmation may be saved.' })
+  }
+  const displayName = typeof body.displayName === 'string' ? body.displayName.trim() : ''
+  const relationship = typeof body.relationship === 'string' ? body.relationship.trim() : ''
+  const memberType = body.memberType
+  if (displayName.length < 2 || displayName.length > 120) {
+    return response.status(400).json({ error: 'Enter a family member name between 2 and 120 characters.' })
+  }
+  if (!relationship || relationship.length > 40) {
+    return response.status(400).json({ error: 'Enter a relationship up to 40 characters.' })
+  }
+  if (!['adult', 'minor'].includes(memberType)) {
+    return response.status(400).json({ error: 'Choose whether this family member is an adult or a minor.' })
+  }
+  if (body.authorizationConfirmed !== true) {
+    return response.status(400).json({ error: 'Confirm that the adult has consented or that you are authorized to manage this minor.' })
+  }
+
+  let client
+  try {
+    client = await pool.connect()
+    await client.query('BEGIN')
+    const authorizationType = memberType === 'adult' ? 'adult_consent' : 'guardian_authorization'
+    const result = await client.query(
+      `INSERT INTO family_profiles
+         (owner_user_id, display_name, relationship, member_type, authorization_type)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id::int AS id, display_name AS "displayName", relationship,
+         member_type AS "memberType", authorization_type AS "authorizationType",
+         authorization_policy_version AS "authorizationVersion",
+         authorization_confirmed_at AS "authorizationConfirmedAt",
+         authorization_revoked_at AS "authorizationRevokedAt", removed_at AS "removedAt",
+         created_at AS "createdAt", updated_at AS "updatedAt"`,
+      [request.user.id, displayName, relationship, memberType, authorizationType],
+    )
+    const profile = result.rows[0]
+    await recordFamilyProfileEvent(client, profile.id, request.user.id, 'created', {
+      memberType,
+      authorizationType,
+      authorizationVersion: 'v1',
+    })
+    await client.query('COMMIT')
+    response.status(201).json(familyProfileRow(profile))
+  } catch (error) {
+    if (client) await client.query('ROLLBACK')
+    next(error)
+  } finally {
+    client?.release()
+  }
+})
+
+app.patch('/api/me/family/:id', requireCustomer, async (request, response, next) => {
+  const profileId = Number(request.params.id)
+  if (!Number.isSafeInteger(profileId) || profileId < 1) return response.status(400).json({ error: 'Invalid family profile ID.' })
+  const body = request.body ?? {}
+  const allowedFields = new Set(['displayName', 'relationship'])
+  if (!Object.keys(body).length || Object.keys(body).some((key) => !allowedFields.has(key))) {
+    return response.status(400).json({ error: 'Update only the family member name or relationship.' })
+  }
+  let client
+  try {
+    client = await pool.connect()
+    await client.query('BEGIN')
+    const existing = await client.query(
+      `${familyProfileSelect}
+       WHERE id = $1 AND owner_user_id = $2
+       FOR UPDATE`,
+      [profileId, request.user.id],
+    )
+    if (!existing.rowCount) {
+      await client.query('ROLLBACK')
+      return response.status(404).json({ error: 'Family profile was not found.' })
+    }
+    if (existing.rows[0].removedAt || existing.rows[0].authorizationRevokedAt) {
+      await client.query('ROLLBACK')
+      return response.status(409).json({ error: 'A removed or revoked family profile cannot be edited.' })
+    }
+    const displayName = Object.hasOwn(body, 'displayName')
+      ? typeof body.displayName === 'string' ? body.displayName.trim() : ''
+      : existing.rows[0].displayName
+    const relationship = Object.hasOwn(body, 'relationship')
+      ? typeof body.relationship === 'string' ? body.relationship.trim() : ''
+      : existing.rows[0].relationship
+    if (displayName.length < 2 || displayName.length > 120) {
+      await client.query('ROLLBACK')
+      return response.status(400).json({ error: 'Enter a family member name between 2 and 120 characters.' })
+    }
+    if (!relationship || relationship.length > 40) {
+      await client.query('ROLLBACK')
+      return response.status(400).json({ error: 'Enter a relationship up to 40 characters.' })
+    }
+    const updated = await client.query(
+      `UPDATE family_profiles SET display_name = $3, relationship = $4, updated_at = now()
+       WHERE id = $1 AND owner_user_id = $2
+       RETURNING id::int AS id, display_name AS "displayName", relationship,
+         member_type AS "memberType", authorization_type AS "authorizationType",
+         authorization_policy_version AS "authorizationVersion",
+         authorization_confirmed_at AS "authorizationConfirmedAt",
+         authorization_revoked_at AS "authorizationRevokedAt", removed_at AS "removedAt",
+         created_at AS "createdAt", updated_at AS "updatedAt"`,
+      [profileId, request.user.id, displayName, relationship],
+    )
+    await recordFamilyProfileEvent(client, profileId, request.user.id, 'updated', {
+      changedFields: Object.keys(body),
+    })
+    await client.query('COMMIT')
+    response.json(familyProfileRow(updated.rows[0]))
+  } catch (error) {
+    if (client) await client.query('ROLLBACK')
+    next(error)
+  } finally {
+    client?.release()
+  }
+})
+
+app.post('/api/me/family/:id/revoke', requireCustomer, async (request, response, next) => {
+  const profileId = Number(request.params.id)
+  if (!Number.isSafeInteger(profileId) || profileId < 1) return response.status(400).json({ error: 'Invalid family profile ID.' })
+  let client
+  try {
+    client = await pool.connect()
+    await client.query('BEGIN')
+    const existing = await client.query(
+      `${familyProfileSelect}
+       WHERE id = $1 AND owner_user_id = $2
+       FOR UPDATE`,
+      [profileId, request.user.id],
+    )
+    if (!existing.rowCount || existing.rows[0].removedAt) {
+      await client.query('ROLLBACK')
+      return response.status(404).json({ error: 'Family profile was not found.' })
+    }
+    if (existing.rows[0].authorizationRevokedAt) {
+      await client.query('COMMIT')
+      return response.json(familyProfileRow(existing.rows[0]))
+    }
+    const updated = await client.query(
+      `UPDATE family_profiles SET authorization_revoked_at = now(), updated_at = now()
+       WHERE id = $1 AND owner_user_id = $2
+       RETURNING id::int AS id, display_name AS "displayName", relationship,
+         member_type AS "memberType", authorization_type AS "authorizationType",
+         authorization_policy_version AS "authorizationVersion",
+         authorization_confirmed_at AS "authorizationConfirmedAt",
+         authorization_revoked_at AS "authorizationRevokedAt", removed_at AS "removedAt",
+         created_at AS "createdAt", updated_at AS "updatedAt"`,
+      [profileId, request.user.id],
+    )
+    await recordFamilyProfileEvent(client, profileId, request.user.id, 'authorization_revoked')
+    await client.query('COMMIT')
+    response.json(familyProfileRow(updated.rows[0]))
+  } catch (error) {
+    if (client) await client.query('ROLLBACK')
+    next(error)
+  } finally {
+    client?.release()
+  }
+})
+
+app.delete('/api/me/family/:id', requireCustomer, async (request, response, next) => {
+  const profileId = Number(request.params.id)
+  if (!Number.isSafeInteger(profileId) || profileId < 1) return response.status(400).json({ error: 'Invalid family profile ID.' })
+  let client
+  try {
+    client = await pool.connect()
+    await client.query('BEGIN')
+    const existing = await client.query(
+      `${familyProfileSelect}
+       WHERE id = $1 AND owner_user_id = $2
+       FOR UPDATE`,
+      [profileId, request.user.id],
+    )
+    if (!existing.rowCount) {
+      await client.query('ROLLBACK')
+      return response.status(404).json({ error: 'Family profile was not found.' })
+    }
+    if (existing.rows[0].removedAt) {
+      await client.query('COMMIT')
+      return response.json(familyProfileRow(existing.rows[0]))
+    }
+    const removed = await client.query(
+      `UPDATE family_profiles
+       SET display_name = 'Removed profile', relationship = 'removed',
+         authorization_revoked_at = COALESCE(authorization_revoked_at, now()),
+         removed_at = now(), updated_at = now()
+       WHERE id = $1 AND owner_user_id = $2
+       RETURNING id::int AS id, display_name AS "displayName", relationship,
+         member_type AS "memberType", authorization_type AS "authorizationType",
+         authorization_policy_version AS "authorizationVersion",
+         authorization_confirmed_at AS "authorizationConfirmedAt",
+         authorization_revoked_at AS "authorizationRevokedAt", removed_at AS "removedAt",
+         created_at AS "createdAt", updated_at AS "updatedAt"`,
+      [profileId, request.user.id],
+    )
+    await recordFamilyProfileEvent(client, profileId, request.user.id, 'removed')
+    await client.query('COMMIT')
+    response.json(familyProfileRow(removed.rows[0]))
+  } catch (error) {
+    if (client) await client.query('ROLLBACK')
+    next(error)
+  } finally {
+    client?.release()
+  }
+})
+
 app.get('/api/me/addresses', requireCustomer, async (request, response, next) => {
   try {
     const result = await pool.query(
@@ -895,6 +1315,86 @@ async function categoryId(client, name) {
     [name],
   )
   return result.rows[0].id
+}
+
+async function createInventoryBatch(client, medicineId, item, quantity, batchNumber) {
+  if (quantity <= 0) return null
+  const result = await client.query(
+    `INSERT INTO inventory_batches
+      (medicine_id, batch_number, quantity_received, quantity_remaining, expiry_date)
+     VALUES ($1, $2, $3, $3, $4)
+     RETURNING id::int AS id`,
+    [medicineId, batchNumber, quantity, item.expiry],
+  )
+  return result.rows[0].id
+}
+
+async function setInventoryBatchesToStock(client, medicineId, item) {
+  const batches = await client.query(
+    `SELECT id::int AS id, batch_number AS "batchNumber", quantity_received AS "quantityReceived",
+       quantity_remaining AS "quantityRemaining", expiry_date::text AS expiry
+     FROM inventory_batches
+     WHERE medicine_id = $1
+     ORDER BY expiry_date ASC NULLS LAST, received_at ASC, id ASC
+     FOR UPDATE`,
+    [medicineId],
+  )
+  let batchTotal = batches.rows.reduce((total, batch) => total + batch.quantityRemaining, 0)
+  let difference = item.stock - batchTotal
+  const changes = []
+
+  if (difference > 0) {
+    let batch = item.batchNumber
+      ? batches.rows.find((row) => row.batchNumber === item.batchNumber)
+      : null
+    if (batch && batch.expiry !== item.expiry) {
+      throw new ApiError(
+        409,
+        'That batch number already exists with a different expiry date. Use a new batch number for the additional stock.',
+        'BATCH_EXPIRY_MISMATCH',
+      )
+    }
+
+    let batchId
+    if (batch) {
+      const updated = await client.query(
+        `UPDATE inventory_batches
+         SET quantity_received = quantity_received + $2,
+             quantity_remaining = quantity_remaining + $2
+         WHERE id = $1
+         RETURNING id::int AS id`,
+        [batch.id, difference],
+      )
+      batchId = updated.rows[0].id
+    } else {
+      const batchNumber = item.batchNumber || `ADJUST-${randomUUID()}`
+      batchId = await createInventoryBatch(client, medicineId, item, difference, batchNumber)
+    }
+    changes.push({ batchId, quantityChange: difference })
+  } else if (difference < 0) {
+    difference = -difference
+    for (const batch of batches.rows) {
+      if (difference === 0) break
+      const quantityChange = Math.min(difference, batch.quantityRemaining)
+      if (!quantityChange) continue
+      await client.query(
+        'UPDATE inventory_batches SET quantity_remaining = quantity_remaining - $2 WHERE id = $1',
+        [batch.id, quantityChange],
+      )
+      changes.push({ batchId: batch.id, quantityChange: -quantityChange })
+      difference -= quantityChange
+    }
+  }
+
+  for (const change of changes) {
+    await client.query(
+      `INSERT INTO stock_movements (medicine_id, inventory_batch_id, movement_type, quantity_change, note)
+       VALUES ($1, $2, 'adjustment', $3, 'Owner inventory adjustment')`,
+      [medicineId, change.batchId, change.quantityChange],
+    )
+  }
+  batchTotal = item.stock
+  return batchTotal
 }
 
 app.get('/api/health', async (_request, response, next) => {
@@ -1363,8 +1863,17 @@ app.get('/api/catalog/medicines', async (request, response, next) => {
        JOIN pharmacies p ON p.id = m.pharmacy_id AND p.approval_status = 'approved'
        LEFT JOIN pharmacy_settings ps ON ps.setting_key = 'marketplace:' || p.id::text
        LEFT JOIN (
-         SELECT medicine_id, AVG(rating)::float8 AS rating, COUNT(*)::int AS "reviewCount"
-         FROM product_reviews GROUP BY medicine_id
+         SELECT r.medicine_id, AVG(r.rating)::float8 AS rating, COUNT(*)::int AS "reviewCount"
+         FROM product_reviews r
+         WHERE EXISTS (
+           SELECT 1 FROM sales_orders o
+           WHERE o.id = r.order_id AND o.customer_id = r.customer_id AND o.status = 'delivered'
+             AND EXISTS (
+               SELECT 1 FROM sales_order_items i
+               WHERE i.order_id = o.id AND i.medicine_id = r.medicine_id
+             )
+         )
+         GROUP BY r.medicine_id
        ) r ON r.medicine_id = m.id
        WHERE m.is_active AND (${availableStockExpression}) > 0
          AND ($1::bigint IS NULL OR m.pharmacy_id = $1)
@@ -1561,6 +2070,39 @@ app.get('/api/medicines', requireOwner, async (request, response, next) => {
   }
 })
 
+app.post(
+  '/api/owner/product-images',
+  requireOwner,
+  express.raw({ type: ['image/jpeg', 'image/png', 'image/webp'], limit: '5mb' }),
+  async (request, response, next) => {
+    const contentType = (request.get('content-type') || '').split(';', 1)[0].trim().toLowerCase()
+    if (!['image/jpeg', 'image/png', 'image/webp'].includes(contentType)) {
+      return response.status(415).json({ error: 'Choose a JPEG, PNG, or WebP image.' })
+    }
+    if (!Buffer.isBuffer(request.body) || request.body.length === 0) {
+      return response.status(400).json({ error: 'Choose a non-empty product image.' })
+    }
+    const extension = productImageExtension(contentType, request.body)
+    if (!extension) {
+      return response.status(400).json({ error: 'The selected file is not a valid supported image.' })
+    }
+    const pharmacyId = request.user.pharmacyId
+    if (!Number.isSafeInteger(pharmacyId) || pharmacyId < 1) {
+      return response.status(403).json({ error: 'This owner account has no pharmacy to upload images for.' })
+    }
+
+    const fileName = `${randomUUID()}.${extension}`
+    const ownerDirectory = join(productImageDirectory, String(pharmacyId))
+    try {
+      await mkdir(ownerDirectory, { recursive: true })
+      await writeFile(join(ownerDirectory, fileName), request.body, { flag: 'wx' })
+      response.status(201).json({ imageUrl: `/api/uploads/products/${pharmacyId}/${fileName}` })
+    } catch (error) {
+      next(error)
+    }
+  },
+)
+
 app.post('/api/medicines', requireOwner, async (request, response, next) => {
   const parsed = medicineInput(request.body)
   if (parsed.error) return response.status(400).json({ error: parsed.error })
@@ -1589,10 +2131,18 @@ app.post('/api/medicines', requireOwner, async (request, response, next) => {
     )
     const id = inserted.rows[0].id
     if (item.stock > 0) {
+      const batchId = await createInventoryBatch(
+        client,
+        id,
+        item,
+        item.stock,
+        item.batchNumber || `OPENING-${id}`,
+      )
       await client.query(
-        `INSERT INTO stock_movements (medicine_id, movement_type, quantity_change, note)
-         VALUES ($1, 'opening', $2, 'Opening inventory')`,
-        [id, item.stock],
+        `INSERT INTO stock_movements
+          (medicine_id, inventory_batch_id, movement_type, quantity_change, note)
+         VALUES ($1, $2, 'opening', $3, 'Opening inventory')`,
+        [id, batchId, item.stock],
       )
     }
     const result = await client.query(
@@ -1623,13 +2173,14 @@ app.put('/api/medicines/:id', requireOwner, async (request, response, next) => {
     client = await pool.connect()
     await client.query('BEGIN')
     const existing = await client.query(
-      'SELECT stock FROM medicines WHERE id = $1 AND pharmacy_id = $2 AND is_active FOR UPDATE',
+      'SELECT id FROM medicines WHERE id = $1 AND pharmacy_id = $2 AND is_active FOR UPDATE',
       [id, request.user.pharmacyId],
     )
     if (!existing.rowCount) {
       await client.query('ROLLBACK')
       return response.status(404).json({ error: 'Medicine was not found.' })
     }
+    await setInventoryBatchesToStock(client, id, parsed.value)
     const category = await categoryId(client, parsed.value.category)
     const item = parsed.value
     await client.query(
@@ -1647,14 +2198,6 @@ app.put('/api/medicines/:id', requireOwner, async (request, response, next) => {
         item.expiry, item.price, item.stock, item.reorderLevel, item.gstRate, item.hsnCode,
         item.prescriptionRequired, item.description, item.imageUrl, request.user.pharmacyId],
     )
-    const stockChange = item.stock - existing.rows[0].stock
-    if (stockChange !== 0) {
-      await client.query(
-        `INSERT INTO stock_movements (medicine_id, movement_type, quantity_change, note)
-         VALUES ($1, 'adjustment', $2, 'Owner inventory adjustment')`,
-        [id, stockChange],
-      )
-    }
     const result = await client.query(
       `${medicineQuery} WHERE m.id = $1 AND m.pharmacy_id = $2`,
       [id, request.user.pharmacyId],
@@ -2079,18 +2622,80 @@ const orderSelect = `
         'prescriptionId', i.prescription_id::int,
         'prescriptionRequired', i.prescription_required_at_order,
         'unitPrice', i.unit_price::float8, 'discountAmount', i.discount_amount::float8,
-        'taxAmount', i.tax_amount::float8, 'lineTotal', i.line_total::float8
+        'taxAmount', i.tax_amount::float8, 'lineTotal', i.line_total::float8,
+        'snapshot', i.medicine_snapshot
       ) ORDER BY i.id)
       FROM sales_order_items i WHERE i.order_id = o.id
     ), '[]'::json) AS items,
     COALESCE((
-      SELECT json_agg(json_build_object('status', e.status, 'createdAt', e.created_at) ORDER BY e.created_at, e.id)
+      SELECT json_agg(json_build_object(
+        'status', e.status,
+        'createdAt', e.created_at,
+        'actorRole', e.actor_role,
+        'actorName', e.actor_name,
+        'note', e.note
+      ) ORDER BY e.created_at, e.id)
       FROM order_status_events e WHERE e.order_id = o.id
     ), '[]'::json) AS events
   FROM sales_orders o
   JOIN pharmacies p ON p.id = o.pharmacy_id
   LEFT JOIN customers c ON c.id = o.customer_id
 `
+
+const orderStatusNotificationLabel = {
+  pending: 'pending',
+  accepted: 'accepted',
+  preparing: 'being prepared',
+  ready: 'ready for dispatch',
+  out_for_delivery: 'out for delivery',
+  delivered: 'delivered',
+  declined: 'declined',
+  cancelled: 'cancelled',
+}
+
+async function createOrderNotification(client, {
+  eventId,
+  orderId,
+  orderNumber,
+  pharmacyId,
+  recipientRole,
+  status,
+  note = null,
+}) {
+  const recipients = recipientRole === 'pharmacy_owner'
+    ? await client.query(
+      `SELECT id FROM user_accounts
+       WHERE role = 'pharmacy_owner' AND pharmacy_id = $1
+       ORDER BY id`,
+      [pharmacyId],
+    )
+    : await client.query(
+      `SELECT c.user_account_id AS id
+       FROM sales_orders o
+       JOIN customers c ON c.id = o.customer_id
+       LEFT JOIN customer_settings s ON s.user_account_id = c.user_account_id
+       WHERE o.id = $1 AND c.user_account_id IS NOT NULL
+         AND COALESCE(s.order_notifications_enabled, true)`,
+      [orderId],
+    )
+  const label = orderStatusNotificationLabel[status] ?? status.replaceAll('_', ' ')
+  const type = recipientRole === 'pharmacy_owner' ? 'order_placed' : 'order_status'
+  const title = recipientRole === 'pharmacy_owner' ? 'New customer order' : `Order ${label}`
+  const message = recipientRole === 'pharmacy_owner'
+    ? `Order ${orderNumber} is waiting for review.`
+    : `Order ${orderNumber} is now ${label}.${note ? ` ${note}` : ''}`
+
+  for (const recipient of recipients.rows) {
+    await client.query(
+      `INSERT INTO notifications
+         (order_status_event_id, recipient_user_id, recipient_role, pharmacy_id,
+          type, reference_type, reference_id, title, message)
+       VALUES ($1, $2, $3, $4, $5, 'sales_order', $6, $7, $8)
+       ON CONFLICT (order_status_event_id, recipient_user_id) DO NOTHING`,
+      [eventId, recipient.id, recipientRole, pharmacyId, type, orderId, title, message],
+    )
+  }
+}
 
 const roundMoney = (value) => Math.round((value + Number.EPSILON) * 100) / 100
 
@@ -2450,10 +3055,254 @@ app.post('/api/checkout/quote', requireCustomer, async (request, response, next)
   }
 })
 
+async function placeLegacyOrder(request, response, next) {
+  const items = request.body?.items
+  const paymentMethod = typeof request.body?.paymentMethod === 'string' ? request.body.paymentMethod.trim() : ''
+  const requestedPharmacyId = request.body?.pharmacyId
+  const idempotencyKey = request.get('idempotency-key')?.trim() || ''
+  if (!Array.isArray(items) || items.length < 1 || items.length > 30 ||
+      items.some((item) => !Number.isSafeInteger(item?.medicineId) || item.medicineId < 1 ||
+        !Number.isSafeInteger(item?.quantity) || item.quantity < 1 || item.quantity > 50 ||
+        (item.unitPrice !== undefined && (typeof item.unitPrice !== 'number' || priceToCents(item.unitPrice) === null))) ||
+      new Set(items.map((item) => item.medicineId)).size !== items.length) {
+    return response.status(400).json({ error: 'Choose between 1 and 30 medicines with valid quantities.' })
+  }
+  if (!['Cash on Delivery', 'UPI Payment'].includes(paymentMethod)) {
+    return response.status(400).json({ error: 'Choose a supported payment method.' })
+  }
+  if (!/^[\da-f]{8}-[\da-f]{4}-[1-8][\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/i.test(idempotencyKey)) {
+    return response.status(400).json({ error: 'A valid Idempotency-Key UUID is required.' })
+  }
+  const normalizedItems = items.map((item) => ({
+    medicineId: item.medicineId,
+    quantity: item.quantity,
+    expectedPriceCents: item.unitPrice === undefined ? null : priceToCents(item.unitPrice),
+  })).sort((left, right) => left.medicineId - right.medicineId)
+  const requestHash = createHash('sha256')
+    .update(JSON.stringify({ items: normalizedItems, paymentMethod, pharmacyId: requestedPharmacyId ?? null }))
+    .digest('hex')
+
+  let client
+  try {
+    client = await pool.connect()
+    await client.query('BEGIN')
+    const customer = await client.query(
+      `SELECT c.id FROM customers c JOIN user_accounts u ON u.id = c.user_account_id
+       WHERE c.user_account_id = $1 AND u.role = 'customer'`,
+      [request.user.id],
+    )
+    if (!customer.rowCount) throw new ApiError(404, 'Customer profile was not found.')
+    const customerId = customer.rows[0].id
+    const claim = await client.query(
+      `INSERT INTO order_idempotency_keys (customer_id, idempotency_key, request_hash)
+       VALUES ($1, $2, $3) ON CONFLICT (customer_id, idempotency_key) DO NOTHING
+       RETURNING customer_id`,
+      [customerId, idempotencyKey, requestHash],
+    )
+    if (!claim.rowCount) {
+      const previous = await client.query(
+        `SELECT request_hash AS "requestHash", order_id::int AS "orderId"
+         FROM order_idempotency_keys WHERE customer_id = $1 AND idempotency_key = $2`,
+        [customerId, idempotencyKey],
+      )
+      if (previous.rows[0]?.requestHash !== requestHash) {
+        throw new ApiError(409, 'This idempotency key was already used for a different order request.', 'IDEMPOTENCY_KEY_REUSED')
+      }
+      if (!previous.rows[0]?.orderId) {
+        throw new ApiError(503, 'The previous order request is still being finalized. Retry with the same key.', 'ORDER_REQUEST_PENDING')
+      }
+      const replay = await client.query(
+        `${orderSelect} WHERE o.id = $1 AND c.user_account_id = $2`,
+        [previous.rows[0].orderId, request.user.id],
+      )
+      await client.query('COMMIT')
+      return response.status(200).json({ ...replay.rows[0], idempotentReplay: true })
+    }
+
+    const address = await client.query(
+      `SELECT NULLIF(concat_ws(', ', NULLIF(address, ''), city, state, postal_code), '') AS address,
+         latitude, longitude
+       FROM customer_addresses WHERE user_account_id = $1 AND is_default
+       ORDER BY id LIMIT 1`,
+      [request.user.id],
+    )
+    const savedAddress = address.rows[0]
+    const deliveryAddress = savedAddress?.address ||
+      (savedAddress?.latitude != null ? `GPS ${savedAddress.latitude}, ${savedAddress.longitude}` : '')
+    if (!deliveryAddress) throw new ApiError(400, 'Add a delivery address or GPS location in your profile before ordering.')
+
+    const medicineIds = normalizedItems.map((item) => item.medicineId)
+    const medicines = await client.query(
+      `SELECT m.id::int AS id, m.pharmacy_id::int AS "pharmacyId", m.name,
+         m.generic_name AS "genericName", m.pack, m.sku, m.manufacturer,
+         COALESCE(c.name, 'Uncategorized') AS category, m.price::text AS price,
+         m.stock, m.prescription_required AS "prescriptionRequired"
+       FROM medicines m LEFT JOIN categories c ON c.id = m.category_id
+       WHERE m.id = ANY($1::bigint[]) AND m.is_active
+       ORDER BY m.id FOR UPDATE OF m`,
+      [medicineIds],
+    )
+    if (medicines.rowCount !== items.length) throw new ApiError(409, 'One or more medicines are no longer available.', 'MEDICINE_UNAVAILABLE')
+    const pharmacyIds = new Set(medicines.rows.map((item) => item.pharmacyId))
+    if (pharmacyIds.size !== 1) throw new ApiError(400, 'Place separate orders for medicines from different pharmacies.')
+    const pharmacyId = [...pharmacyIds][0]
+    if (requestedPharmacyId !== undefined && Number(requestedPharmacyId) !== pharmacyId) {
+      throw new ApiError(409, 'The cart pharmacy changed. Refresh your cart and try again.', 'PHARMACY_CHANGED')
+    }
+    const medicineById = new Map(medicines.rows.map((item) => [item.id, item]))
+    for (const item of normalizedItems) {
+      const medicine = medicineById.get(item.medicineId)
+      const currentPriceCents = priceToCents(medicine.price)
+      if (item.expectedPriceCents !== null && item.expectedPriceCents !== currentPriceCents) {
+        throw new ApiError(409, `The price for ${medicine.name} changed. Refresh your cart.`, 'PRICE_CHANGED')
+      }
+      if (medicine.prescriptionRequired) {
+        throw new ApiError(403, `${medicine.name} requires a verified prescription.`, 'PRESCRIPTION_REQUIRED')
+      }
+      if (medicine.stock < item.quantity) throw new ApiError(409, `There is not enough stock for ${medicine.name}.`, 'INSUFFICIENT_STOCK')
+    }
+
+    const batches = await client.query(
+      `SELECT id::int AS id, medicine_id::int AS "medicineId", quantity_remaining AS "quantityRemaining"
+       FROM inventory_batches
+       WHERE medicine_id = ANY($1::bigint[]) AND quantity_remaining > 0
+         AND (expiry_date IS NULL OR expiry_date >= CURRENT_DATE)
+       ORDER BY medicine_id, expiry_date ASC NULLS LAST, received_at ASC, id ASC
+       FOR UPDATE`,
+      [medicineIds],
+    )
+    const batchesByMedicine = new Map()
+    for (const batch of batches.rows) {
+      const list = batchesByMedicine.get(batch.medicineId) ?? []
+      list.push(batch)
+      batchesByMedicine.set(batch.medicineId, list)
+    }
+    for (const item of normalizedItems) {
+      const available = (batchesByMedicine.get(item.medicineId) ?? []).reduce((sum, batch) => sum + batch.quantityRemaining, 0)
+      if (available < item.quantity) throw new ApiError(409, 'There is not enough unexpired batch stock.', 'INSUFFICIENT_UNEXPIRED_STOCK')
+    }
+
+    const subtotalCents = normalizedItems.reduce((sum, item) =>
+      sum + priceToCents(medicineById.get(item.medicineId).price) * item.quantity, 0)
+    const taxCents = Math.round(subtotalCents * 0.05)
+    const deliveryFeeCents = subtotalCents > 0 ? 4900 : 0
+    const totalCents = subtotalCents + taxCents + deliveryFeeCents
+    const orderNumber = `PH-${Date.now().toString(36).toUpperCase()}-${randomBytes(3).toString('hex').toUpperCase()}`
+    const inserted = await client.query(
+      `INSERT INTO sales_orders
+       (order_number, customer_id, pharmacy_id, status, payment_method, subtotal, tax_amount,
+        delivery_fee, total, delivery_address, payment_status)
+       VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $8, $9, 'pending')
+       RETURNING id::int AS id`,
+      [orderNumber, customerId, pharmacyId, paymentMethod, subtotalCents / 100, taxCents / 100,
+        deliveryFeeCents / 100, totalCents / 100, deliveryAddress],
+    )
+    const orderId = inserted.rows[0].id
+    const deliveryCode = deriveDeliveryCode(deliveryCodeKeyRing, orderId)
+    await client.query(
+      `UPDATE sales_orders SET delivery_code_verifier = $2, delivery_code_key_version = $3 WHERE id = $1`,
+      [orderId, createDeliveryCodeVerifier(deliveryCodeKeyRing, orderId, deliveryCode), deliveryCodeKeyRing.currentVersion],
+    )
+    await client.query(
+      `INSERT INTO payments (order_id, amount, method, status) VALUES ($1, $2, $3, 'pending')`,
+      [orderId, totalCents / 100, paymentMethod],
+    )
+
+    for (const item of normalizedItems) {
+      const medicine = medicineById.get(item.medicineId)
+      const unitPriceCents = priceToCents(medicine.price)
+      const snapshot = { medicineId: medicine.id, name: medicine.name, genericName: medicine.genericName,
+        category: medicine.category, pack: medicine.pack, sku: medicine.sku, manufacturer: medicine.manufacturer,
+        unitPrice: unitPriceCents / 100 }
+      const orderItem = await client.query(
+        `INSERT INTO sales_order_items
+         (order_id, medicine_id, medicine_name, quantity, unit_price, line_total, medicine_snapshot)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb) RETURNING id::int AS id`,
+        [orderId, item.medicineId, medicine.name, item.quantity, unitPriceCents / 100,
+          unitPriceCents * item.quantity / 100, JSON.stringify(snapshot)],
+      )
+      let remaining = item.quantity
+      for (const batch of batchesByMedicine.get(item.medicineId) ?? []) {
+        if (remaining === 0) break
+        const quantity = Math.min(remaining, batch.quantityRemaining)
+        const deduction = await client.query(
+          `UPDATE inventory_batches SET quantity_remaining = quantity_remaining - $2
+           WHERE id = $1 AND quantity_remaining >= $2 RETURNING id`,
+          [batch.id, quantity],
+        )
+        if (!deduction.rowCount) throw new ApiError(409, 'Inventory changed while placing the order.', 'INVENTORY_CHANGED')
+        await client.query(
+          `INSERT INTO order_item_batch_allocations (order_item_id, inventory_batch_id, quantity)
+           VALUES ($1, $2, $3)`,
+          [orderItem.rows[0].id, batch.id, quantity],
+        )
+        await client.query(
+          `INSERT INTO sales_order_item_batches (order_item_id, inventory_batch_id, quantity)
+           VALUES ($1, $2, $3)`,
+          [orderItem.rows[0].id, batch.id, quantity],
+        )
+        await client.query(
+          `INSERT INTO stock_movements (medicine_id, inventory_batch_id, movement_type, quantity_change, note)
+           VALUES ($1, $2, 'sale', $3, $4)`,
+          [item.medicineId, batch.id, -quantity, `Order ${orderNumber}`],
+        )
+        batch.quantityRemaining -= quantity
+        remaining -= quantity
+      }
+      if (remaining > 0) throw new ApiError(409, 'There is not enough unexpired batch stock.', 'INSUFFICIENT_UNEXPIRED_STOCK')
+      const stockUpdate = await client.query(
+        `UPDATE medicines SET stock = stock - $2, updated_at = now()
+         WHERE id = $1 AND stock >= $2 RETURNING id`,
+        [item.medicineId, item.quantity],
+      )
+      if (!stockUpdate.rowCount) throw new ApiError(409, 'Inventory changed while placing the order.', 'INVENTORY_CHANGED')
+    }
+    const pendingEvent = await client.query(
+      `INSERT INTO order_status_events
+       (order_id, status, actor_user_id, actor_role, actor_name)
+       VALUES ($1, 'pending', $2, 'customer', $3) RETURNING id`,
+      [orderId, request.user.id, request.user.fullName],
+    )
+    await createOrderNotification(client, {
+      eventId: pendingEvent.rows[0].id, orderId, orderNumber, pharmacyId,
+      recipientRole: 'pharmacy_owner', status: 'pending',
+    })
+    await client.query(
+      `INSERT INTO audit_events (actor, action, entity_type, entity_id, details)
+       VALUES ($1, 'order_created', 'sales_order', $2, $3::jsonb)`,
+      [request.user.email, orderId, JSON.stringify({ toStatus: 'pending', orderNumber })],
+    )
+    await client.query(
+      `UPDATE order_idempotency_keys SET order_id = $3
+       WHERE customer_id = $1 AND idempotency_key = $2`,
+      [customerId, idempotencyKey, orderId],
+    )
+    const order = await client.query(`${orderSelect} WHERE o.id = $1`, [orderId])
+    await client.query('COMMIT')
+    return response.status(201).json(order.rows[0])
+  } catch (error) {
+    if (client) await rollbackTransaction(client)
+    if (error instanceof ApiError) {
+      return response.status(error.status).json({ error: error.message, code: error.code, ...error.details })
+    }
+    if (error.code === '40001' || error.code === '40P01') {
+      return response.status(503).json({ error: 'Inventory is busy. Retry with the same Idempotency-Key.', code: 'ORDER_RETRY' })
+    }
+    next(error)
+  } finally {
+    client?.release()
+  }
+}
+
 app.post(['/api/orders', '/api/customer/orders'], requireCustomer, async (request, response, next) => {
+  const quoteId = typeof request.body?.quoteId === 'string' ? request.body.quoteId : ''
+  if (!quoteId) return placeLegacyOrder(request, response, next)
   const parsed = parseCheckoutRequest(request.body)
   if (parsed.error) return response.status(parsed.status).json({ error: parsed.error })
-  const quoteId = typeof request.body?.quoteId === 'string' ? request.body.quoteId : ''
+  const items = parsed.value.items
+  const paymentMethod = parsed.value.paymentMethod
+  const requestedPharmacyId = undefined
+  const idempotencyKey = request.get('idempotency-key')?.trim() || ''
   const savedQuote = checkoutQuotes.get(quoteId)
   if (!savedQuote || savedQuote.userId !== request.user.id || savedQuote.expiresAt <= Date.now()) {
     checkoutQuotes.delete(quoteId)
@@ -2462,11 +3311,68 @@ app.post(['/api/orders', '/api/customer/orders'], requireCustomer, async (reques
   if (JSON.stringify(savedQuote.checkout) !== JSON.stringify(parsed.value)) {
     return response.status(409).json({ error: 'Cart or checkout options changed. Request a fresh quote before placing the order.' })
   }
+  if (
+    requestedPharmacyId !== undefined &&
+    (!Number.isSafeInteger(requestedPharmacyId) || requestedPharmacyId < 1)
+  ) {
+    return response.status(400).json({ error: 'Choose a valid pharmacy for this order.' })
+  }
+  if (!/^[\da-f]{8}-[\da-f]{4}-[1-8][\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/i.test(idempotencyKey)) {
+    return response.status(400).json({ error: 'A valid Idempotency-Key UUID is required.' })
+  }
+  if (items.some((item) =>
+    item.unitPrice !== undefined &&
+    (typeof item.unitPrice !== 'number' || priceToCents(item.unitPrice) === null),
+  )) {
+    return response.status(400).json({ error: 'Medicine prices must be valid non-negative amounts.' })
+  }
 
+  const normalizedItems = items
+    .map((item) => ({
+      medicineId: item.medicineId,
+      quantity: item.quantity,
+      expectedPriceCents: item.unitPrice === undefined ? null : priceToCents(item.unitPrice),
+    }))
+    .sort((left, right) => left.medicineId - right.medicineId)
+  const requestHash = createHash('sha256')
+    .update(JSON.stringify({ items: normalizedItems, paymentMethod, pharmacyId: requestedPharmacyId ?? null }))
+    .digest('hex')
   let client
   try {
     client = await pool.connect()
     await client.query('BEGIN')
+    const customerClaim = await client.query(
+      `SELECT c.id FROM customers c JOIN user_accounts u ON u.id = c.user_account_id
+       WHERE c.user_account_id = $1 AND u.role = 'customer'`,
+      [request.user.id],
+    )
+    if (!customerClaim.rowCount) throw new ApiError(404, 'Customer profile was not found.')
+    const customerIdForKey = customerClaim.rows[0].id
+    const claim = await client.query(
+      `INSERT INTO order_idempotency_keys (customer_id, idempotency_key, request_hash)
+       VALUES ($1, $2, $3) ON CONFLICT (customer_id, idempotency_key) DO NOTHING
+       RETURNING customer_id`,
+      [customerIdForKey, idempotencyKey, requestHash],
+    )
+    if (!claim.rowCount) {
+      const previous = await client.query(
+        `SELECT request_hash AS "requestHash", order_id::int AS "orderId"
+         FROM order_idempotency_keys WHERE customer_id = $1 AND idempotency_key = $2`,
+        [customerIdForKey, idempotencyKey],
+      )
+      if (previous.rows[0]?.requestHash !== requestHash) {
+        throw new ApiError(409, 'This idempotency key was already used for a different order request.', 'IDEMPOTENCY_KEY_REUSED')
+      }
+      if (!previous.rows[0]?.orderId) {
+        throw new ApiError(503, 'The previous order request is still being finalized. Retry with the same key.', 'ORDER_REQUEST_PENDING')
+      }
+      const replay = await client.query(
+        `${orderSelect} WHERE o.id = $1 AND c.user_account_id = $2`,
+        [previous.rows[0].orderId, request.user.id],
+      )
+      await client.query('COMMIT')
+      return response.status(200).json({ ...replay.rows[0], idempotentReplay: true })
+    }
     const currentResult = await buildCheckoutQuote(client, request.user.id, parsed.value, { lockInventory: true })
     if (currentResult.error) {
       await client.query('ROLLBACK')
@@ -2504,22 +3410,29 @@ app.post(['/api/orders', '/api/customer/orders'], requireCustomer, async (reques
         })
       }
     }
-    const deliveryOtp = String(randomInt(100000, 1000000))
-    const otpHash = createHash('sha256').update(deliveryOtp).digest('hex')
     const orderNumber = `PH-${Date.now().toString(36).toUpperCase()}-${randomBytes(3).toString('hex').toUpperCase()}`
     const inserted = await client.query(
       `INSERT INTO sales_orders
-        (order_number, customer_id, pharmacy_id, delivery_otp_hash, status, payment_method,
+        (order_number, customer_id, pharmacy_id, status, payment_method,
          subtotal, discount_amount, discount_code, tax_amount, delivery_fee, total, delivery_address,
          fulfillment_method, delivery_latitude, delivery_longitude, delivery_contact_phone, payment_status)
-       VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'pending')
+       VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'pending')
        RETURNING id::int AS id`,
-      [orderNumber, customerId, quote.pharmacyId, otpHash, quote.paymentMethod, quote.subtotal,
+      [orderNumber, customerId, quote.pharmacyId, quote.paymentMethod, quote.subtotal,
         quote.discountAmount, quote.discountCode, quote.taxAmount, quote.deliveryFee, quote.total,
         quote.deliveryAddress, quote.fulfillmentMethod, quote.deliveryLatitude, quote.deliveryLongitude,
         quote.deliveryContactPhone],
     )
     const orderId = inserted.rows[0].id
+    const deliveryCode = deriveDeliveryCode(deliveryCodeKeyRing, orderId)
+    await client.query(
+      `UPDATE sales_orders SET delivery_code_verifier = $2, delivery_code_key_version = $3 WHERE id = $1`,
+      [orderId, createDeliveryCodeVerifier(deliveryCodeKeyRing, orderId, deliveryCode), deliveryCodeKeyRing.currentVersion],
+    )
+    await client.query(
+      `INSERT INTO payments (order_id, amount, method, status) VALUES ($1, $2, $3, 'pending')`,
+      [orderId, quote.total, quote.paymentMethod],
+    )
     for (const line of quote.items) {
       const medicine = medicineById.get(line.medicineId)
       const orderItem = await client.query(
@@ -2533,10 +3446,14 @@ app.post(['/api/orders', '/api/customer/orders'], requireCustomer, async (reques
           line.baseUnitQuantity, line.packUnit, line.unitPrice, line.discountAmount,
           line.taxAmount, line.lineTotal, line.prescriptionId, line.prescriptionRequired],
       )
-      await client.query(
-        'UPDATE medicines SET stock = stock - $2, updated_at = now() WHERE id = $1',
+      const stockUpdate = await client.query(
+        `UPDATE medicines SET stock = stock - $2, updated_at = now()
+         WHERE id = $1 AND stock >= $2 RETURNING id`,
         [line.medicineId, line.quantity],
       )
+      if (!stockUpdate.rowCount) {
+        throw new ApiError(409, `Stock for ${line.name} changed while placing the order.`, 'INVENTORY_CHANGED')
+      }
       if (medicine.hasBatches) {
         const batches = await client.query(
           `SELECT id::int AS id, quantity_remaining AS quantity
@@ -2560,6 +3477,11 @@ app.post(['/api/orders', '/api/customer/orders'], requireCustomer, async (reques
              VALUES ($1, $2, $3)`,
             [orderItem.rows[0].id, batch.id, quantity],
           )
+          await client.query(
+            `INSERT INTO order_item_batch_allocations (order_item_id, inventory_batch_id, quantity)
+             VALUES ($1, $2, $3)`,
+            [orderItem.rows[0].id, batch.id, quantity],
+          )
           remaining -= quantity
         }
         if (remaining > 0) {
@@ -2572,24 +3494,131 @@ app.post(['/api/orders', '/api/customer/orders'], requireCustomer, async (reques
         [line.medicineId, -line.quantity, `Order ${orderNumber}`],
       )
     }
+    const pendingEvent = await client.query(
+      `INSERT INTO order_status_events
+        (order_id, status, actor_user_id, actor_role, actor_name)
+       VALUES ($1, 'pending', $2, 'customer', $3)
+       RETURNING id`,
+      [orderId, request.user.id, request.user.fullName],
+    )
+    await createOrderNotification(client, {
+      eventId: pendingEvent.rows[0].id,
+      orderId,
+      orderNumber,
+      pharmacyId,
+      recipientRole: 'pharmacy_owner',
+      status: 'pending',
+    })
     await client.query(
-      `INSERT INTO payments (order_id, amount, method, status)
-       VALUES ($1, $2, $3, 'pending')`,
-      [orderId, quote.total, quote.paymentMethod],
+      `INSERT INTO audit_events (actor, action, entity_type, entity_id, details)
+       VALUES ($1, 'order_created', 'sales_order', $2, $3::jsonb)`,
+      [
+        request.user.email,
+        orderId,
+        JSON.stringify({
+          toStatus: 'pending',
+          actorUserId: request.user.id,
+          actorRole: 'customer',
+          actorName: request.user.fullName,
+          orderNumber,
+        }),
+      ],
     )
     await client.query(
-      `INSERT INTO order_status_events (order_id, status) VALUES ($1, 'pending')`,
-      [orderId],
+      `UPDATE order_idempotency_keys
+       SET order_id = $3
+       WHERE customer_id = $1 AND idempotency_key = $2`,
+      [customerId, idempotencyKey, orderId],
     )
     const order = await client.query(`${orderSelect} WHERE o.id = $1`, [orderId])
     await client.query('COMMIT')
-    checkoutQuotes.delete(quoteId)
-    response.status(201).json({ ...order.rows[0], deliveryOtp })
+    response.status(201).json(order.rows[0])
   } catch (error) {
-    if (client) await client.query('ROLLBACK')
+    if (client) await rollbackTransaction(client)
+    if (error instanceof ApiError) {
+      return response.status(error.status).json({ error: error.message, code: error.code, ...error.details })
+    }
+    if (error.code === '40001' || error.code === '40P01') {
+      return response.status(503).json({ error: 'Inventory is busy. Retry this order with the same Idempotency-Key.', code: 'ORDER_RETRY' })
+    }
     next(error)
   } finally {
     client?.release()
+  }
+})
+
+app.get(['/api/orders/:id', '/api/customer/orders/:id'], requireAuth, async (request, response, next) => {
+  const id = Number(request.params.id)
+  if (!Number.isSafeInteger(id) || id < 1) return response.status(400).json({ error: 'Invalid order ID.' })
+  if (!['customer', 'pharmacy_owner'].includes(request.user.role)) {
+    return response.status(403).json({ error: 'This account cannot view orders.' })
+  }
+
+  try {
+    const predicate = request.user.role === 'customer'
+      ? 'o.id = $1 AND c.user_account_id = $2'
+      : 'o.id = $1 AND o.pharmacy_id = $2'
+    const result = await pool.query(
+      `${orderSelect} WHERE ${predicate}`,
+      [id, request.user.role === 'customer' ? request.user.id : request.user.pharmacyId],
+    )
+    if (!result.rowCount) return response.status(404).json({ error: 'Order was not found.' })
+    response.json(result.rows[0])
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.get('/api/me/orders/:id/delivery-code', requireCustomer, async (request, response, next) => {
+  const id = Number(request.params.id)
+  if (!Number.isSafeInteger(id) || id < 1) return response.status(400).json({ error: 'Invalid order ID.' })
+  try {
+    const result = await pool.query(
+      `SELECT o.id, o.status, o.delivery_code_verifier AS verifier,
+         o.delivery_code_key_version AS "keyVersion"
+       FROM sales_orders o
+       JOIN customers c ON c.id = o.customer_id
+       WHERE o.id = $1 AND c.user_account_id = $2`,
+      [id, request.user.id],
+    )
+    if (!result.rowCount) return response.status(404).json({ error: 'Order was not found.' })
+    const order = result.rows[0]
+    if (order.status !== 'out_for_delivery') {
+      return response.status(409).json({ error: 'The delivery code is available only while your order is out for delivery.' })
+    }
+    if (!order.verifier || !order.keyVersion) {
+      return response.status(503).json({ error: 'The delivery code is not available. Contact the pharmacy.' })
+    }
+    const code = deriveDeliveryCode(deliveryCodeKeyRing, id, order.keyVersion)
+    if (!verifyDeliveryCode(deliveryCodeKeyRing, id, code, order.verifier, order.keyVersion)) {
+      throw new Error(`Delivery-code verifier mismatch for order ${id}.`)
+    }
+    response.set('Cache-Control', 'no-store')
+    response.json({ code })
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.get('/api/me/orders/:id/events', requireCustomer, async (request, response, next) => {
+  const id = Number(request.params.id)
+  if (!Number.isSafeInteger(id) || id < 1) return response.status(400).json({ error: 'Invalid order ID.' })
+
+  try {
+    const result = await pool.query(
+      `SELECT e.status, e.created_at AS "createdAt",
+         e.actor_role AS "actorRole", e.actor_name AS "actorName", e.note
+       FROM sales_orders o
+       JOIN customers c ON c.id = o.customer_id
+       LEFT JOIN order_status_events e ON e.order_id = o.id
+       WHERE o.id = $1 AND c.user_account_id = $2
+       ORDER BY e.created_at NULLS FIRST, e.id`,
+      [id, request.user.id],
+    )
+    if (!result.rowCount) return response.status(404).json({ error: 'Order was not found.' })
+    response.json(result.rows.filter((event) => event.status !== null))
+  } catch (error) {
+    next(error)
   }
 })
 
@@ -2619,6 +3648,285 @@ app.get('/api/owner/orders', requireOwner, async (request, response, next) => {
   }
 })
 
+async function listNotifications(request, response, next, recipientRole) {
+  const owner = recipientRole === 'pharmacy_owner'
+  try {
+    const values = owner
+      ? [request.user.id, recipientRole, request.user.pharmacyId]
+      : [request.user.id, recipientRole]
+    const pharmacyFilter = owner ? 'AND n.pharmacy_id = $3' : ''
+    const [notifications, unreadCount] = await Promise.all([
+      pool.query(
+        `SELECT n.id::int AS id, n.type, n.title, n.message,
+           n.reference_type AS "referenceType", n.reference_id::int AS "referenceId",
+           n.is_read AS "isRead", n.created_at AS "createdAt",
+           e.status AS "eventStatus", COALESCE(e.created_at, n.created_at) AS "eventTime",
+           o.order_number AS "orderNumber", o.status AS "currentStatus",
+           m.name AS "medicineName", m.pharmacy_id::int AS "medicinePharmacyId"
+         FROM notifications n
+         LEFT JOIN order_status_events e ON e.id = n.order_status_event_id
+         LEFT JOIN sales_orders o ON o.id = n.reference_id AND n.reference_type = 'sales_order'
+         LEFT JOIN medicines m ON m.id = n.reference_id AND n.reference_type = 'medicine'
+         WHERE n.recipient_user_id = $1 AND n.recipient_role = $2 ${pharmacyFilter}
+         ORDER BY n.created_at DESC, n.id DESC
+         LIMIT 100`,
+        values,
+      ),
+      pool.query(
+        `SELECT COUNT(*)::int AS count
+         FROM notifications n
+         WHERE n.recipient_user_id = $1 AND n.recipient_role = $2
+           ${pharmacyFilter}`,
+        values,
+      ),
+    ])
+    response.set('Cache-Control', 'no-store')
+    response.json({
+      notifications: notifications.rows,
+      unreadCount: unreadCount.rows[0].count,
+    })
+  } catch (error) {
+    next(error)
+  }
+}
+
+app.get('/api/me/notifications', requireCustomer, (request, response, next) => {
+  void listNotifications(request, response, next, 'customer')
+})
+app.get('/api/owner/notifications', requireOwner, (request, response, next) => {
+  void listNotifications(request, response, next, 'pharmacy_owner')
+})
+
+async function markNotificationRead(request, response, next, recipientRole) {
+  const id = Number(request.params.id)
+  if (!Number.isSafeInteger(id) || id < 1) return response.status(400).json({ error: 'Invalid notification ID.' })
+  try {
+    const result = await pool.query(
+      `UPDATE notifications
+       SET is_read = true, read_at = COALESCE(read_at, now())
+       WHERE id = $1 AND recipient_user_id = $2 AND recipient_role = $3
+         AND ($4::bigint IS NULL OR pharmacy_id = $4)
+       RETURNING id::int AS id, is_read AS "isRead", read_at AS "readAt"`,
+      [id, request.user.id, recipientRole, recipientRole === 'pharmacy_owner' ? request.user.pharmacyId : null],
+    )
+    if (!result.rowCount) return response.status(404).json({ error: 'Notification was not found.' })
+    response.json(result.rows[0])
+  } catch (error) {
+    next(error)
+  }
+}
+
+app.patch('/api/me/notifications/:id', requireCustomer, (request, response, next) => {
+  void markNotificationRead(request, response, next, 'customer')
+})
+app.patch('/api/owner/notifications/:id', requireOwner, (request, response, next) => {
+  void markNotificationRead(request, response, next, 'pharmacy_owner')
+})
+
+app.get('/api/me/reminders', requireCustomer, async (request, response, next) => {
+  try {
+    const [reminders, stockAlerts, history] = await Promise.all([
+      pool.query(
+        `SELECT r.id::int AS id, r.medicine_id::int AS "medicineId", m.name AS "medicineName",
+           r.pharmacy_id::int AS "pharmacyId", p.name AS "pharmacyName", r.opt_in AS "optIn",
+           r.next_reminder_date AS "nextReminderDate", r.interval_days AS "intervalDays",
+           r.last_sent_at AS "lastSentAt", r.cancelled_at AS "cancelledAt"
+         FROM medicine_reminders r
+         JOIN medicines m ON m.id = r.medicine_id
+         LEFT JOIN pharmacies p ON p.id = r.pharmacy_id
+         WHERE r.customer_account_id = $1
+         ORDER BY r.updated_at DESC, r.id DESC`,
+        [request.user.id],
+      ),
+      pool.query(
+        `SELECT s.id::int AS id, s.medicine_id::int AS "medicineId", m.name AS "medicineName",
+           s.pharmacy_id::int AS "pharmacyId", p.name AS "pharmacyName", s.active,
+           s.last_sent_at AS "lastSentAt", s.cancelled_at AS "cancelledAt"
+         FROM stock_alert_subscriptions s
+         JOIN medicines m ON m.id = s.medicine_id
+         LEFT JOIN pharmacies p ON p.id = s.pharmacy_id
+         WHERE s.customer_account_id = $1
+         ORDER BY s.updated_at DESC, s.id DESC`,
+        [request.user.id],
+      ),
+      pool.query(
+        `SELECT id::int AS id, medicine_id::int AS "medicineId", pharmacy_id::int AS "pharmacyId",
+           alert_type AS "alertType", status, reason, created_at AS "createdAt"
+         FROM medicine_alert_events
+         WHERE customer_account_id = $1
+         ORDER BY created_at DESC, id DESC
+         LIMIT 100`,
+        [request.user.id],
+      ),
+    ])
+    response.json({ reminders: reminders.rows, stockAlerts: stockAlerts.rows, history: history.rows })
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.post('/api/me/reminders', requireCustomer, async (request, response, next) => {
+  const medicineId = Number(request.body?.medicineId)
+  const pharmacyId = request.body?.pharmacyId === undefined ? null : Number(request.body?.pharmacyId)
+  const nextReminderDate = typeof request.body?.nextReminderDate === 'string'
+    ? request.body.nextReminderDate
+    : ''
+  const intervalDays = request.body?.intervalDays === undefined ? 30 : Number(request.body?.intervalDays)
+  if (!Number.isSafeInteger(medicineId) || medicineId < 1 ||
+      (pharmacyId !== null && (!Number.isSafeInteger(pharmacyId) || pharmacyId < 1)) ||
+      !/^\d{4}-\d{2}-\d{2}$/.test(nextReminderDate) ||
+      !Number.isSafeInteger(intervalDays) || intervalDays < 1 || intervalDays > 365) {
+    return response.status(400).json({ error: 'Choose a valid medicine, future reminder date, and 1–365 day interval.' })
+  }
+  const reminderDate = new Date(`${nextReminderDate}T00:00:00.000Z`)
+  if (Number.isNaN(reminderDate.getTime()) || reminderDate.toISOString().slice(0, 10) !== nextReminderDate ||
+      reminderDate.getTime() < Date.now()) {
+    return response.status(400).json({ error: 'The refill reminder date must be today or in the future.' })
+  }
+  let client
+  try {
+    client = await pool.connect()
+    await client.query('BEGIN')
+    const medicine = await client.query(
+      `SELECT m.id, m.pharmacy_id AS "pharmacyId"
+       FROM medicines m JOIN pharmacies p ON p.id = m.pharmacy_id
+       WHERE m.id = $1 AND m.is_active AND p.approval_status = 'approved'
+       FOR SHARE`,
+      [medicineId],
+    )
+    if (!medicine.rowCount ||
+        (pharmacyId !== null && medicine.rows[0].pharmacyId !== pharmacyId)) {
+      await client.query('ROLLBACK')
+      return response.status(404).json({ error: 'This medicine is not available from the selected verified pharmacy.' })
+    }
+    const saved = await client.query(
+      `INSERT INTO medicine_reminders
+         (customer_account_id, medicine_id, pharmacy_id, opt_in, next_reminder_date, interval_days)
+       VALUES ($1, $2, $3, true, $4, $5)
+       ON CONFLICT (customer_account_id, medicine_id) DO UPDATE SET
+         pharmacy_id = EXCLUDED.pharmacy_id,
+         opt_in = true,
+         next_reminder_date = EXCLUDED.next_reminder_date,
+         interval_days = EXCLUDED.interval_days,
+         cancelled_at = NULL,
+         updated_at = now()
+       RETURNING id::int AS id, medicine_id::int AS "medicineId",
+         pharmacy_id::int AS "pharmacyId", opt_in AS "optIn",
+         next_reminder_date AS "nextReminderDate", interval_days AS "intervalDays"`,
+      [request.user.id, medicineId, pharmacyId ?? medicine.rows[0].pharmacyId, nextReminderDate, intervalDays],
+    )
+    await client.query('COMMIT')
+    response.status(201).json(saved.rows[0])
+  } catch (error) {
+    if (client) await rollbackTransaction(client)
+    next(error)
+  } finally {
+    client?.release()
+  }
+})
+
+app.patch('/api/me/reminders/:id', requireCustomer, async (request, response, next) => {
+  const id = Number(request.params.id)
+  const optIn = request.body?.optIn
+  const nextReminderDate = request.body?.nextReminderDate
+  const intervalDays = request.body?.intervalDays
+  if (!Number.isSafeInteger(id) || id < 1) return response.status(400).json({ error: 'Invalid reminder ID.' })
+  if (optIn !== undefined && typeof optIn !== 'boolean') {
+    return response.status(400).json({ error: 'optIn must be true or false.' })
+  }
+  if (intervalDays !== undefined &&
+      (!Number.isSafeInteger(intervalDays) || intervalDays < 1 || intervalDays > 365)) {
+    return response.status(400).json({ error: 'Interval must be 1–365 days.' })
+  }
+  if (nextReminderDate !== undefined &&
+      (typeof nextReminderDate !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(nextReminderDate))) {
+    return response.status(400).json({ error: 'Choose a valid reminder date.' })
+  }
+  try {
+    const result = await pool.query(
+      `UPDATE medicine_reminders r
+       SET opt_in = COALESCE($3, r.opt_in),
+           next_reminder_date = COALESCE($4::date, r.next_reminder_date),
+           interval_days = COALESCE($5, r.interval_days),
+           cancelled_at = CASE WHEN $3 = false THEN now() ELSE NULL END,
+           updated_at = now()
+       WHERE r.id = $1
+         AND r.customer_account_id = $2
+       RETURNING r.id::int AS id, r.opt_in AS "optIn",
+         r.next_reminder_date AS "nextReminderDate", r.interval_days AS "intervalDays",
+         r.cancelled_at AS "cancelledAt"`,
+      [id, request.user.id, optIn, nextReminderDate ?? null, intervalDays ?? null],
+    )
+    if (!result.rowCount) return response.status(404).json({ error: 'Reminder was not found.' })
+    response.json(result.rows[0])
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.post('/api/me/stock-alerts', requireCustomer, async (request, response, next) => {
+  const medicineId = Number(request.body?.medicineId)
+  if (!Number.isSafeInteger(medicineId) || medicineId < 1) {
+    return response.status(400).json({ error: 'Choose a valid medicine.' })
+  }
+  let client
+  try {
+    client = await pool.connect()
+    await client.query('BEGIN')
+    const medicine = await client.query(
+      `SELECT m.id, m.pharmacy_id AS "pharmacyId"
+       FROM medicines m JOIN pharmacies p ON p.id = m.pharmacy_id
+       WHERE m.id = $1 AND m.is_active AND p.approval_status = 'approved'
+       FOR SHARE`,
+      [medicineId],
+    )
+    if (!medicine.rowCount) {
+      await client.query('ROLLBACK')
+      return response.status(404).json({ error: 'This medicine is not available from a verified pharmacy.' })
+    }
+    const saved = await client.query(
+      `INSERT INTO stock_alert_subscriptions
+         (customer_account_id, medicine_id, pharmacy_id, active)
+       VALUES ($1, $2, $3, true)
+       ON CONFLICT (customer_account_id, medicine_id) DO UPDATE SET
+         pharmacy_id = EXCLUDED.pharmacy_id,
+         active = true,
+         cancelled_at = NULL,
+         updated_at = now()
+       RETURNING id::int AS id, medicine_id::int AS "medicineId",
+         pharmacy_id::int AS "pharmacyId", active,
+         last_sent_at AS "lastSentAt"`,
+      [request.user.id, medicineId, medicine.rows[0].pharmacyId],
+    )
+    await client.query('COMMIT')
+    response.status(201).json(saved.rows[0])
+  } catch (error) {
+    if (client) await rollbackTransaction(client)
+    next(error)
+  } finally {
+    client?.release()
+  }
+})
+
+app.patch('/api/me/stock-alerts/:id', requireCustomer, async (request, response, next) => {
+  const id = Number(request.params.id)
+  if (!Number.isSafeInteger(id) || id < 1) return response.status(400).json({ error: 'Invalid stock alert ID.' })
+  try {
+    const result = await pool.query(
+      `UPDATE stock_alert_subscriptions s
+       SET active = false, cancelled_at = now(), updated_at = now()
+       WHERE s.id = $1
+         AND s.customer_account_id = $2
+       RETURNING s.id::int AS id, s.active, s.cancelled_at AS "cancelledAt"`,
+      [id, request.user.id],
+    )
+    if (!result.rowCount) return response.status(404).json({ error: 'Stock alert was not found.' })
+    response.json(result.rows[0])
+  } catch (error) {
+    next(error)
+  }
+})
+
 app.get('/api/owner/stock-movements', requireOwner, async (request, response, next) => {
   try {
     const result = await pool.query(
@@ -2638,19 +3946,21 @@ app.get('/api/owner/stock-movements', requireOwner, async (request, response, ne
   }
 })
 
-app.put('/api/owner/orders/:id/status', requireOwner, async (request, response, next) => {
+async function transitionOwnerOrder(request, response, next) {
   const id = Number(request.params.id)
   const nextStatus = request.body?.status
-  const otp = typeof request.body?.otp === 'string' ? request.body.otp.trim() : ''
+  const expectedStatus = request.body?.expectedStatus
+  const rawNote = request.body?.note
+  const note = typeof rawNote === 'string' ? rawNote.trim() : ''
   if (!Number.isSafeInteger(id) || id < 1) return response.status(400).json({ error: 'Invalid order ID.' })
-  const transitions = {
-    pending: ['accepted', 'declined'],
-    accepted: ['preparing'],
-    preparing: ['out_for_delivery'],
-    out_for_delivery: ['delivered'],
-    delivered: [],
-    declined: [],
-    cancelled: [],
+  if (!isOrderStatus(expectedStatus)) {
+    return response.status(400).json({ error: 'A valid expectedStatus is required.' })
+  }
+  if (typeof rawNote !== 'undefined' && typeof rawNote !== 'string') {
+    return response.status(400).json({ error: 'The transition note must be text.' })
+  }
+  if (note.length > 500) {
+    return response.status(400).json({ error: 'The transition note must be 500 characters or fewer.' })
   }
 
   let client
@@ -2658,7 +3968,7 @@ app.put('/api/owner/orders/:id/status', requireOwner, async (request, response, 
     client = await pool.connect()
     await client.query('BEGIN')
     const order = await client.query(
-      'SELECT id, status, delivery_otp_hash FROM sales_orders WHERE id = $1 AND pharmacy_id = $2 FOR UPDATE',
+      'SELECT id, status, order_number AS "orderNumber" FROM sales_orders WHERE id = $1 AND pharmacy_id = $2 FOR UPDATE',
       [id, request.user.pharmacyId],
     )
     if (!order.rowCount) {
@@ -2666,30 +3976,15 @@ app.put('/api/owner/orders/:id/status', requireOwner, async (request, response, 
       return response.status(404).json({ error: 'Order was not found.' })
     }
     const current = order.rows[0]
-    if (!transitions[current.status]?.includes(nextStatus)) {
+    if (current.status !== expectedStatus) {
       await client.query('ROLLBACK')
-      return response.status(409).json({ error: `Cannot change an order from ${current.status} to ${nextStatus}.` })
+      return response.status(409).json({
+        error: 'This order changed since you opened it. Refresh and try again.',
+        code: 'ORDER_STATUS_CONFLICT',
+        currentStatus: current.status,
+      })
     }
     if (nextStatus !== 'declined') {
-      const prescriptionItems = await client.query(
-        `SELECT prescription_id, medicine_id
-         FROM sales_order_items
-         WHERE order_id = $1 AND prescription_required_at_order
-         ORDER BY id`,
-        [id],
-      )
-      for (const item of prescriptionItems.rows) {
-        if (item.prescription_id === null) continue
-        await client.query(
-          `SELECT p.id
-           FROM prescriptions p
-           JOIN prescription_medicines pm
-             ON pm.prescription_id = p.id AND pm.medicine_id = $2
-           WHERE p.id = $1
-           FOR SHARE OF p, pm`,
-          [item.prescription_id, item.medicine_id],
-        )
-      }
       const invalidPrescription = await client.query(
         `SELECT 1
          FROM sales_order_items i
@@ -2712,60 +4007,50 @@ app.put('/api/owner/orders/:id/status', requireOwner, async (request, response, 
         })
       }
     }
-    if (nextStatus === 'delivered') {
-      const suppliedHash = createHash('sha256').update(otp).digest()
-      const storedHash = Buffer.from(current.delivery_otp_hash || '', 'hex')
-      if (!/^\d{6}$/.test(otp) || storedHash.length !== suppliedHash.length || !timingSafeEqual(suppliedHash, storedHash)) {
-        await client.query('ROLLBACK')
-        return response.status(400).json({ error: 'The delivery code is incorrect. Ask the customer to confirm the code.' })
-      }
-    }
-    if (nextStatus === 'declined') {
-      const items = await client.query(
-        'SELECT id, medicine_id, quantity, prescription_id FROM sales_order_items WHERE order_id = $1 AND medicine_id IS NOT NULL',
-        [id],
-      )
-      for (const item of items.rows) {
-        if (item.prescription_id !== null) {
-          await client.query(
-            `UPDATE prescription_medicines
-             SET reserved_quantity = GREATEST(0, reserved_quantity - $3)
-             WHERE prescription_id = $1 AND medicine_id = $2`,
-            [item.prescription_id, item.medicine_id, item.quantity],
-          )
-        }
-        const allocations = await client.query(
-          `SELECT inventory_batch_id, quantity
-           FROM sales_order_item_batches WHERE order_item_id = $1`,
-          [item.id],
-        )
-        for (const allocation of allocations.rows) {
-          if (allocation.inventory_batch_id === null) continue
-          await client.query(
-            'UPDATE inventory_batches SET quantity_remaining = quantity_remaining + $2 WHERE id = $1',
-            [allocation.inventory_batch_id, allocation.quantity],
-          )
-        }
-        await client.query(
-          'UPDATE medicines SET stock = stock + $2, updated_at = now() WHERE id = $1',
-          [item.medicine_id, item.quantity],
-        )
-        await client.query(
-          `INSERT INTO stock_movements (medicine_id, movement_type, quantity_change, note)
-           VALUES ($1, 'return', $2, $3)`,
-          [item.medicine_id, item.quantity, `Restocked after order ${id} was declined`],
-        )
-      }
+    if (!canTransitionOrderStatus(current.status, nextStatus)) {
+      await client.query('ROLLBACK')
+      return response.status(409).json({
+        error: `Cannot change an order from ${current.status} to ${nextStatus}.`,
+        code: 'ORDER_STATUS_CONFLICT',
+        currentStatus: current.status,
+      })
     }
     await client.query(
-      `UPDATE sales_orders SET status = $2, updated_at = now(),
-         delivery_otp_hash = CASE WHEN $2 = 'delivered' THEN NULL ELSE delivery_otp_hash END
+      `UPDATE sales_orders SET status = $2, updated_at = now()
        WHERE id = $1`,
       [id, nextStatus],
     )
+    const statusEvent = await client.query(
+      `INSERT INTO order_status_events
+        (order_id, status, actor_user_id, actor_role, actor_name, note)
+       VALUES ($1, $2, $3, 'pharmacy_owner', $4, $5)
+       RETURNING id`,
+      [id, nextStatus, request.user.id, request.user.fullName, note || null],
+    )
+    await createOrderNotification(client, {
+      eventId: statusEvent.rows[0].id,
+      orderId: id,
+      orderNumber: current.orderNumber,
+      pharmacyId: request.user.pharmacyId,
+      recipientRole: 'customer',
+      status: nextStatus,
+      note: note || null,
+    })
     await client.query(
-      'INSERT INTO order_status_events (order_id, status) VALUES ($1, $2)',
-      [id, nextStatus],
+      `INSERT INTO audit_events (actor, action, entity_type, entity_id, details)
+       VALUES ($1, 'order_status_transition', 'sales_order', $2, $3::jsonb)`,
+      [
+        request.user.email,
+        id,
+        JSON.stringify({
+          fromStatus: current.status,
+          toStatus: nextStatus,
+          actorUserId: request.user.id,
+          actorRole: 'pharmacy_owner',
+          actorName: request.user.fullName,
+          note: note || null,
+        }),
+      ],
     )
     const updated = await client.query(`${orderSelect} WHERE o.id = $1`, [id])
     await client.query('COMMIT')
@@ -2776,23 +4061,412 @@ app.put('/api/owner/orders/:id/status', requireOwner, async (request, response, 
   } finally {
     client?.release()
   }
-})
+}
+
+app.post('/api/owner/orders/:id/transition', requireOwner, transitionOwnerOrder)
+app.put('/api/owner/orders/:id/status', requireOwner, transitionOwnerOrder)
+
+async function verifyOwnerDelivery(request, response, next) {
+  const id = Number(request.params.id)
+  const code = typeof request.body?.code === 'string' ? request.body.code.trim() : ''
+  if (!Number.isSafeInteger(id) || id < 1) return response.status(400).json({ error: 'Invalid order ID.' })
+
+  let client
+  try {
+    client = await pool.connect()
+    await client.query('BEGIN')
+    const result = await client.query(
+      `SELECT id, status, order_number AS "orderNumber", delivery_code_verifier AS verifier,
+         delivery_code_key_version AS "keyVersion",
+         delivery_failed_attempts AS "failedAttempts",
+         delivery_locked_until AS "lockedUntil"
+       FROM sales_orders
+       WHERE id = $1 AND pharmacy_id = $2
+       FOR UPDATE`,
+      [id, request.user.pharmacyId],
+    )
+    if (!result.rowCount) {
+      await client.query('ROLLBACK')
+      return response.status(404).json({ error: 'Order was not found.' })
+    }
+    const order = result.rows[0]
+    if (order.status !== 'out_for_delivery') {
+      await client.query('ROLLBACK')
+      return response.status(409).json({
+        error: 'Only orders out for delivery can be verified.',
+        code: 'ORDER_STATUS_CONFLICT',
+        currentStatus: order.status,
+      })
+    }
+
+    if (order.lockedUntil && new Date(order.lockedUntil).getTime() > Date.now()) {
+      await client.query(
+        `INSERT INTO delivery_verification_attempts
+           (order_id, actor_user_id, outcome, failed_attempts, locked_until)
+         VALUES ($1, $2, 'locked', $3, $4)`,
+        [id, request.user.id, order.failedAttempts, order.lockedUntil],
+      )
+      await client.query(
+        `INSERT INTO audit_events (actor, action, entity_type, entity_id, details)
+         VALUES ($1, 'delivery_verification_locked', 'sales_order', $2, $3::jsonb)`,
+        [request.user.email, id, JSON.stringify({ actorUserId: request.user.id, failedAttempts: order.failedAttempts })],
+      )
+      await client.query('COMMIT')
+      return response.status(429).json({
+        error: 'Delivery verification is temporarily locked after too many incorrect codes.',
+        code: 'DELIVERY_CODE_LOCKED',
+        lockedUntil: order.lockedUntil,
+      })
+    }
+
+    const expiredLock = Boolean(order.lockedUntil)
+    const previousAttempts = expiredLock ? 0 : order.failedAttempts
+    const valid = order.verifier && order.keyVersion &&
+      verifyDeliveryCode(deliveryCodeKeyRing, id, code, order.verifier, order.keyVersion)
+    if (!valid) {
+      const failedAttempts = Math.min(previousAttempts + 1, 5)
+      const lockedUntil = failedAttempts === 5 ? new Date(Date.now() + 10 * 60 * 1000) : null
+      await client.query(
+        `UPDATE sales_orders
+         SET delivery_failed_attempts = $2, delivery_locked_until = $3
+         WHERE id = $1`,
+        [id, failedAttempts, lockedUntil],
+      )
+      await client.query(
+        `INSERT INTO delivery_verification_attempts
+           (order_id, actor_user_id, outcome, failed_attempts, locked_until)
+         VALUES ($1, $2, 'failed', $3, $4)`,
+        [id, request.user.id, failedAttempts, lockedUntil],
+      )
+      await client.query(
+        `INSERT INTO audit_events (actor, action, entity_type, entity_id, details)
+         VALUES ($1, 'delivery_verification_failed', 'sales_order', $2, $3::jsonb)`,
+        [request.user.email, id, JSON.stringify({
+          actorUserId: request.user.id,
+          failedAttempts,
+          locked: Boolean(lockedUntil),
+        })],
+      )
+      await client.query('COMMIT')
+      return response.status(401).json({
+        error: 'The delivery code is incorrect. Ask the customer to confirm it.',
+        code: 'DELIVERY_CODE_INVALID',
+        attemptsRemaining: 5 - failedAttempts,
+        ...(lockedUntil ? { lockedUntil } : {}),
+      })
+    }
+
+    await client.query(
+      `UPDATE sales_orders
+       SET status = 'delivered', delivery_otp_hash = NULL,
+           delivery_code_verifier = NULL, delivery_code_key_version = NULL,
+           delivery_failed_attempts = 0, delivery_locked_until = NULL,
+           updated_at = now()
+       WHERE id = $1`,
+      [id],
+    )
+    await client.query(
+      `INSERT INTO delivery_verification_attempts
+         (order_id, actor_user_id, outcome, failed_attempts)
+       VALUES ($1, $2, 'verified', $3)`,
+      [id, request.user.id, previousAttempts],
+    )
+    const deliveredEvent = await client.query(
+      `INSERT INTO order_status_events
+         (order_id, status, actor_user_id, actor_role, actor_name)
+       VALUES ($1, 'delivered', $2, 'pharmacy_owner', $3)
+       RETURNING id`,
+      [id, request.user.id, request.user.fullName],
+    )
+    await createOrderNotification(client, {
+      eventId: deliveredEvent.rows[0].id,
+      orderId: id,
+      orderNumber: result.rows[0].orderNumber,
+      pharmacyId: request.user.pharmacyId,
+      recipientRole: 'customer',
+      status: 'delivered',
+    })
+    await client.query(
+      `INSERT INTO audit_events (actor, action, entity_type, entity_id, details)
+       VALUES ($1, 'delivery_verified', 'sales_order', $2, $3::jsonb)`,
+      [request.user.email, id, JSON.stringify({
+        fromStatus: 'out_for_delivery',
+        toStatus: 'delivered',
+        actorUserId: request.user.id,
+        actorRole: 'pharmacy_owner',
+        actorName: request.user.fullName,
+        failedAttempts: previousAttempts,
+      })],
+    )
+    const updated = await client.query(`${orderSelect} WHERE o.id = $1`, [id])
+    await client.query('COMMIT')
+    response.json(updated.rows[0])
+  } catch (error) {
+    if (client) await rollbackTransaction(client)
+    next(error)
+  } finally {
+    client?.release()
+  }
+}
+
+app.post('/api/owner/orders/:id/verify-delivery', requireOwner, verifyOwnerDelivery)
+
+async function declineOwnerOrder(request, response, next) {
+  const id = Number(request.params.id)
+  const reason = typeof request.body?.reason === 'string' ? request.body.reason.trim() : ''
+  if (!Number.isSafeInteger(id) || id < 1) return response.status(400).json({ error: 'Invalid order ID.' })
+  if (!reason) return response.status(400).json({ error: 'A decline reason is required.' })
+  if (reason.length > 500) return response.status(400).json({ error: 'The decline reason must be 500 characters or fewer.' })
+
+  let client
+  try {
+    client = await pool.connect()
+    await client.query('BEGIN')
+    const order = await client.query(
+      `SELECT id, status, order_number AS "orderNumber"
+       FROM sales_orders
+       WHERE id = $1 AND pharmacy_id = $2
+       FOR UPDATE`,
+      [id, request.user.pharmacyId],
+    )
+    if (!order.rowCount) {
+      await client.query('ROLLBACK')
+      return response.status(404).json({ error: 'Order was not found.' })
+    }
+
+    if (order.rows[0].status === 'declined') {
+      const previousDecline = await client.query(
+        `SELECT note FROM order_status_events
+         WHERE order_id = $1 AND status = 'declined'
+         ORDER BY id DESC
+         LIMIT 1`,
+        [id],
+      )
+      if (previousDecline.rows[0]?.note !== reason) {
+        await client.query('ROLLBACK')
+        return response.status(409).json({
+          error: 'This order has already been declined.',
+          code: 'ORDER_ALREADY_DECLINED',
+        })
+      }
+      const replay = await client.query(
+        `${orderSelect} WHERE o.id = $1 AND o.pharmacy_id = $2`,
+        [id, request.user.pharmacyId],
+      )
+      await client.query('COMMIT')
+      return response.json({ ...replay.rows[0], idempotentReplay: true })
+    }
+
+    if (order.rows[0].status !== 'pending') {
+      await client.query('ROLLBACK')
+      return response.status(409).json({
+        error: `Only pending orders can be declined. This order is ${order.rows[0].status}.`,
+        code: 'ORDER_NOT_PENDING',
+        currentStatus: order.rows[0].status,
+      })
+    }
+
+    const items = await client.query(
+      `SELECT id::int AS id, medicine_id::int AS "medicineId", quantity
+       FROM sales_order_items
+       WHERE order_id = $1
+       ORDER BY medicine_id NULLS FIRST, id
+       FOR UPDATE`,
+      [id],
+    )
+    if (!items.rowCount || items.rows.some((item) => item.medicineId === null)) {
+      await client.query('ROLLBACK')
+      return response.status(409).json({
+        error: 'The original order items cannot be matched to inventory for an exact reversal.',
+        code: 'ORDER_ALLOCATION_MISMATCH',
+      })
+    }
+
+    const medicineIds = [...new Set(items.rows.map((item) => item.medicineId))].sort((a, b) => a - b)
+    const lockedMedicines = await client.query(
+      `SELECT id FROM medicines
+       WHERE id = ANY($1::bigint[])
+       ORDER BY id
+       FOR UPDATE`,
+      [medicineIds],
+    )
+    if (lockedMedicines.rowCount !== medicineIds.length) {
+      await client.query('ROLLBACK')
+      return response.status(409).json({
+        error: 'The original order medicines cannot be locked for an exact stock reversal.',
+        code: 'ORDER_ALLOCATION_MISMATCH',
+      })
+    }
+
+    const allocations = await client.query(
+      `SELECT a.order_item_id::int AS "orderItemId",
+         a.inventory_batch_id::int AS "batchId",
+         i.medicine_id::int AS "medicineId",
+         b.medicine_id::int AS "batchMedicineId",
+         a.quantity
+       FROM order_item_batch_allocations a
+       JOIN sales_order_items i ON i.id = a.order_item_id
+       JOIN inventory_batches b ON b.id = a.inventory_batch_id
+       WHERE i.order_id = $1
+       ORDER BY i.medicine_id, b.expiry_date ASC NULLS LAST, b.received_at ASC, b.id ASC
+       FOR UPDATE OF a, b`,
+      [id],
+    )
+    const allocatedByItem = new Map()
+    const allocatedByMedicine = new Map()
+    for (const allocation of allocations.rows) {
+      if (allocation.medicineId !== allocation.batchMedicineId) {
+        await client.query('ROLLBACK')
+        return response.status(409).json({
+          error: 'An order allocation points to a different medicine batch.',
+          code: 'ORDER_ALLOCATION_MISMATCH',
+        })
+      }
+      allocatedByItem.set(
+        allocation.orderItemId,
+        (allocatedByItem.get(allocation.orderItemId) ?? 0) + allocation.quantity,
+      )
+      allocatedByMedicine.set(
+        allocation.medicineId,
+        (allocatedByMedicine.get(allocation.medicineId) ?? 0) + allocation.quantity,
+      )
+    }
+    if (items.rows.some((item) => allocatedByItem.get(item.id) !== item.quantity)) {
+      await client.query('ROLLBACK')
+      return response.status(409).json({
+        error: 'The original batch allocations do not match the order quantities; no stock was restored.',
+        code: 'ORDER_ALLOCATION_MISMATCH',
+      })
+    }
+
+    for (const allocation of allocations.rows) {
+      const restoredBatch = await client.query(
+        `UPDATE inventory_batches
+         SET quantity_remaining = quantity_remaining + $2
+         WHERE id = $1
+         RETURNING id`,
+        [allocation.batchId, allocation.quantity],
+      )
+      if (!restoredBatch.rowCount) throw new Error(`Original inventory batch ${allocation.batchId} was not found.`)
+      await client.query(
+        `INSERT INTO stock_movements
+          (medicine_id, inventory_batch_id, movement_type, quantity_change, note)
+         VALUES ($1, $2, 'return', $3, $4)`,
+        [allocation.medicineId, allocation.batchId, allocation.quantity, `Order ${id} declined: ${reason}`],
+      )
+    }
+    for (const [medicineId, quantity] of allocatedByMedicine) {
+      const restoredMedicine = await client.query(
+        `UPDATE medicines
+         SET stock = stock + $2, updated_at = now()
+         WHERE id = $1
+         RETURNING id`,
+        [medicineId, quantity],
+      )
+      if (!restoredMedicine.rowCount) throw new Error(`Original medicine ${medicineId} was not found.`)
+    }
+
+    const updatedOrder = await client.query(
+      `UPDATE sales_orders
+       SET status = 'declined', delivery_otp_hash = NULL,
+           delivery_code_verifier = NULL, delivery_code_key_version = NULL,
+           delivery_failed_attempts = 0, delivery_locked_until = NULL, updated_at = now()
+       WHERE id = $1 AND status = 'pending'
+       RETURNING id`,
+      [id],
+    )
+    if (!updatedOrder.rowCount) {
+      await client.query('ROLLBACK')
+      return response.status(409).json({ error: 'The order is no longer pending.', code: 'ORDER_NOT_PENDING' })
+    }
+    const declinedEvent = await client.query(
+      `INSERT INTO order_status_events
+        (order_id, status, actor_user_id, actor_role, actor_name, note)
+       VALUES ($1, 'declined', $2, 'pharmacy_owner', $3, $4)
+       RETURNING id`,
+      [id, request.user.id, request.user.fullName, reason],
+    )
+    await createOrderNotification(client, {
+      eventId: declinedEvent.rows[0].id,
+      orderId: id,
+      orderNumber: order.rows[0].orderNumber,
+      pharmacyId: request.user.pharmacyId,
+      recipientRole: 'customer',
+      status: 'declined',
+      note: reason,
+    })
+    await client.query(
+      `INSERT INTO audit_events (actor, action, entity_type, entity_id, details)
+       VALUES ($1, 'order_declined', 'sales_order', $2, $3::jsonb)`,
+      [
+        request.user.email,
+        id,
+        JSON.stringify({
+          fromStatus: 'pending',
+          toStatus: 'declined',
+          actorUserId: request.user.id,
+          actorRole: 'pharmacy_owner',
+          actorName: request.user.fullName,
+          reason,
+        }),
+      ],
+    )
+    const result = await client.query(
+      `${orderSelect} WHERE o.id = $1 AND o.pharmacy_id = $2`,
+      [id, request.user.pharmacyId],
+    )
+    await client.query('COMMIT')
+    response.json(result.rows[0])
+  } catch (error) {
+    if (client) await client.query('ROLLBACK')
+    next(error)
+  } finally {
+    client?.release()
+  }
+}
+
+app.post('/api/owner/orders/:id/decline', requireOwner, declineOwnerOrder)
 
 app.get('/api/catalog/medicines/:id/reviews', async (request, response, next) => {
   const medicineId = Number(request.params.id)
   if (!Number.isSafeInteger(medicineId) || medicineId < 1) return response.status(400).json({ error: 'Invalid medicine ID.' })
   try {
     const result = await pool.query(
-      `SELECT r.id::int AS id, r.rating, r.comment, r.created_at AS "createdAt", c.full_name AS "customerName"
+      `SELECT r.id::int AS id, r.rating, r.comment, r.created_at AS "createdAt",
+         c.full_name AS "customerName", true AS "verifiedPurchase"
        FROM product_reviews r
        JOIN customers c ON c.id = r.customer_id
        WHERE r.medicine_id = $1
+         AND EXISTS (
+           SELECT 1 FROM sales_orders o
+           WHERE o.id = r.order_id AND o.customer_id = r.customer_id AND o.status = 'delivered'
+             AND EXISTS (
+               SELECT 1 FROM sales_order_items i
+               WHERE i.order_id = o.id AND i.medicine_id = r.medicine_id
+             )
+         )
        ORDER BY r.created_at DESC, r.id DESC
        LIMIT 50`,
       [medicineId],
     )
     const summary = await pool.query(
-      'SELECT COALESCE(AVG(rating), 0)::float8 AS rating, COUNT(*)::int AS "reviewCount" FROM product_reviews WHERE medicine_id = $1',
+      `SELECT COALESCE(SUM(rating * review_count)::float8 / NULLIF(SUM(review_count), 0), 0)::float8 AS rating,
+         COALESCE(SUM(review_count), 0)::int AS "reviewCount",
+         COALESCE(jsonb_object_agg(rating::text, review_count), '{}'::jsonb) AS "ratingDistribution"
+       FROM (
+         SELECT r.rating, COUNT(*)::int AS review_count
+         FROM product_reviews r
+         WHERE r.medicine_id = $1
+           AND EXISTS (
+             SELECT 1 FROM sales_orders o
+             WHERE o.id = r.order_id AND o.customer_id = r.customer_id AND o.status = 'delivered'
+               AND EXISTS (
+                 SELECT 1 FROM sales_order_items i
+                 WHERE i.order_id = o.id AND i.medicine_id = r.medicine_id
+               )
+           )
+         GROUP BY r.rating
+       ) distribution`,
       [medicineId],
     )
     response.json({ reviews: result.rows, ...summary.rows[0] })
@@ -2801,33 +4475,77 @@ app.get('/api/catalog/medicines/:id/reviews', async (request, response, next) =>
   }
 })
 
+app.get('/api/customer/medicines/:id/review-eligibility', requireCustomer, async (request, response, next) => {
+  const medicineId = Number(request.params.id)
+  if (!Number.isSafeInteger(medicineId) || medicineId < 1) return response.status(400).json({ error: 'Invalid medicine ID.' })
+  try {
+    const result = await pool.query(
+      `SELECT EXISTS (SELECT 1 FROM medicines WHERE id = $2) AS "medicineExists",
+         EXISTS (
+           SELECT 1
+           FROM customers c
+           JOIN sales_orders o ON o.customer_id = c.id AND o.status = 'delivered'
+           JOIN sales_order_items i ON i.order_id = o.id AND i.medicine_id = $2
+           WHERE c.user_account_id = $1
+         ) AS eligible,
+         (
+           SELECT json_build_object(
+             'id', r.id::int,
+             'orderId', r.order_id::int,
+             'rating', r.rating,
+             'comment', r.comment
+           )
+           FROM product_reviews r
+           JOIN customers c ON c.id = r.customer_id
+           WHERE c.user_account_id = $1 AND r.medicine_id = $2
+         ) AS review`,
+      [request.user.id, medicineId],
+    )
+    const eligibility = result.rows[0]
+    if (!eligibility.medicineExists) return response.status(404).json({ error: 'Medicine was not found.' })
+    response.json({ eligible: eligibility.eligible, review: eligibility.review })
+  } catch (error) {
+    next(error)
+  }
+})
+
 app.post('/api/customer/medicines/:id/reviews', requireCustomer, async (request, response, next) => {
   const medicineId = Number(request.params.id)
   const rating = request.body?.rating
-  const comment = typeof request.body?.comment === 'string' ? request.body.comment.trim() : ''
+  const rawComment = request.body?.comment
+  const comment = typeof rawComment === 'string' ? rawComment.trim() : ''
   if (!Number.isSafeInteger(medicineId) || medicineId < 1) return response.status(400).json({ error: 'Invalid medicine ID.' })
-  if (!Number.isInteger(rating) || rating < 1 || rating > 5 || comment.length > 500) {
+  if (typeof rawComment !== 'undefined' && typeof rawComment !== 'string') {
+    return response.status(400).json({ error: 'The review comment must be text.' })
+  }
+  if (!Number.isInteger(rating) || rating < 1 || rating > 5 || Array.from(comment).length > 500) {
     return response.status(400).json({ error: 'Choose a 1–5 star rating and keep comments under 500 characters.' })
   }
   try {
     const eligible = await pool.query(
-      `SELECT c.id FROM customers c
+      `SELECT c.id::int AS "customerId", o.id::int AS "orderId"
+       FROM customers c
        JOIN sales_orders o ON o.customer_id = c.id AND o.status = 'delivered'
        JOIN sales_order_items i ON i.order_id = o.id AND i.medicine_id = $2
        WHERE c.user_account_id = $1
+       ORDER BY o.created_at DESC, o.id DESC
        LIMIT 1`,
       [request.user.id, medicineId],
     )
     if (!eligible.rowCount) {
+      const medicine = await pool.query('SELECT 1 FROM medicines WHERE id = $1', [medicineId])
+      if (!medicine.rowCount) return response.status(404).json({ error: 'Medicine was not found.' })
       return response.status(403).json({ error: 'Product reviews are available after your order containing this medicine is delivered.' })
     }
     const result = await pool.query(
-      `INSERT INTO product_reviews (medicine_id, customer_id, rating, comment)
-       VALUES ($1, $2, $3, $4)
+      `INSERT INTO product_reviews (medicine_id, customer_id, order_id, rating, comment)
+       VALUES ($1, $2, $3, $4, $5)
        ON CONFLICT (medicine_id, customer_id) DO UPDATE SET
-         rating = EXCLUDED.rating, comment = EXCLUDED.comment, updated_at = now()
-       RETURNING id::int AS id, rating, comment, created_at AS "createdAt"`,
-      [medicineId, eligible.rows[0].id, rating, comment],
+         order_id = EXCLUDED.order_id, rating = EXCLUDED.rating,
+         comment = EXCLUDED.comment, updated_at = now()
+       RETURNING id::int AS id, order_id::int AS "orderId", rating, comment,
+         created_at AS "createdAt", updated_at AS "updatedAt"`,
+      [medicineId, eligible.rows[0].customerId, eligible.rows[0].orderId, rating, comment],
     )
     response.status(201).json(result.rows[0])
   } catch (error) {
@@ -2886,6 +4604,12 @@ app.use((error, _request, response, _next) => {
         : 'Upload one prescription file with a valid medicine list.',
     })
   }
+  if (error.type === 'entity.too.large') {
+    return response.status(413).json({ error: 'Product images must be 5 MB or smaller.' })
+  }
+  if (error.status === 404) {
+    return response.status(404).json({ error: 'The requested product image was not found.' })
+  }
   if (error.code === '23505') {
     return response.status(409).json({ error: 'That SKU or category already exists.' })
   }
@@ -2908,6 +4632,164 @@ app.get(/.*/, (_request, response, next) => {
   })
 })
 
+async function prepareDeliveryCodes() {
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const activeOrders = await client.query(
+      `SELECT id::int AS id
+       FROM sales_orders
+       WHERE status NOT IN ('delivered', 'declined', 'cancelled')
+         AND (delivery_code_verifier IS NULL OR delivery_code_key_version IS NULL)
+       ORDER BY id
+       FOR UPDATE`,
+    )
+    for (const { id } of activeOrders.rows) {
+      const code = deriveDeliveryCode(deliveryCodeKeyRing, id)
+      await client.query(
+        `UPDATE sales_orders
+         SET delivery_code_verifier = $2, delivery_code_key_version = $3
+         WHERE id = $1`,
+        [id, createDeliveryCodeVerifier(deliveryCodeKeyRing, id, code), deliveryCodeKeyRing.currentVersion],
+      )
+    }
+    await client.query(
+      `UPDATE sales_orders
+       SET delivery_otp_hash = NULL
+       WHERE delivery_otp_hash IS NOT NULL`,
+    )
+    const storedVersions = await client.query(
+      `SELECT DISTINCT delivery_code_key_version AS version
+       FROM sales_orders
+       WHERE status NOT IN ('delivered', 'declined', 'cancelled')
+         AND delivery_code_key_version IS NOT NULL`,
+    )
+    for (const { version } of storedVersions.rows) {
+      if (!deliveryCodeKeyRing.keys.has(version)) {
+        throw new Error(`DELIVERY_CODE_PREVIOUS_KEYS must retain key version "${version}" for active orders.`)
+      }
+    }
+    await client.query('COMMIT')
+  } catch (error) {
+    await rollbackTransaction(client)
+    throw error
+  } finally {
+    client.release()
+  }
+}
+
+async function processMedicineAlerts() {
+  let client
+  try {
+    client = await pool.connect()
+    await client.query('BEGIN')
+
+    const reminders = await client.query(
+      `SELECT r.id, r.customer_account_id AS "customerId", r.medicine_id AS "medicineId",
+         r.pharmacy_id AS "pharmacyId", r.interval_days AS "intervalDays",
+         m.name AS "medicineName", p.name AS "pharmacyName"
+       FROM medicine_reminders r
+       JOIN medicines m ON m.id = r.medicine_id
+       JOIN pharmacies p ON p.id = r.pharmacy_id
+       JOIN user_accounts u ON u.id = r.customer_account_id
+       LEFT JOIN customer_settings cs ON cs.user_account_id = r.customer_account_id
+       WHERE r.opt_in AND r.cancelled_at IS NULL
+         AND r.next_reminder_date <= CURRENT_DATE
+         AND COALESCE(cs.medicine_notifications_enabled, true)
+         AND m.is_active AND p.approval_status = 'approved'
+       ORDER BY r.next_reminder_date, r.id
+       LIMIT 100
+       FOR UPDATE OF r SKIP LOCKED`,
+    )
+    for (const reminder of reminders.rows) {
+      await client.query(
+        `INSERT INTO medicine_alert_events
+           (customer_account_id, medicine_id, pharmacy_id, alert_type, status, reason)
+         VALUES ($1, $2, $3, 'refill_reminder', 'sent',
+                 'Opt-in refill reminder; no automatic order or medication advice')`,
+        [reminder.customerId, reminder.medicineId, reminder.pharmacyId],
+      )
+      await client.query(
+        `INSERT INTO notifications
+           (recipient_user_id, recipient_role, pharmacy_id, type, reference_type, reference_id,
+            title, message)
+         VALUES ($1, 'customer', $2, 'refill_reminder', 'medicine', $3,
+                 'Refill reminder',
+                 $4)
+         ON CONFLICT DO NOTHING`,
+        [
+          reminder.customerId,
+          reminder.pharmacyId,
+          reminder.medicineId,
+          `${reminder.medicineName} at ${reminder.pharmacyName} may be due for a refill. Open the current catalog to check availability.`,
+        ],
+      )
+      await client.query(
+        `UPDATE medicine_reminders
+         SET last_sent_at = now(),
+             next_reminder_date = (CURRENT_DATE + make_interval(days => interval_days)),
+             updated_at = now()
+         WHERE id = $1`,
+        [reminder.id],
+      )
+    }
+
+    const stockAlerts = await client.query(
+      `SELECT s.id, s.customer_account_id AS "customerId", s.medicine_id AS "medicineId",
+         s.pharmacy_id AS "pharmacyId", m.name AS "medicineName", p.name AS "pharmacyName",
+         ${availableStockExpression}::int AS "availableStock"
+       FROM stock_alert_subscriptions s
+       JOIN medicines m ON m.id = s.medicine_id
+       JOIN pharmacies p ON p.id = s.pharmacy_id
+       JOIN user_accounts u ON u.id = s.customer_account_id
+       LEFT JOIN customer_settings cs ON cs.user_account_id = s.customer_account_id
+       WHERE s.active AND s.cancelled_at IS NULL
+         AND COALESCE(cs.medicine_notifications_enabled, true)
+         AND m.is_active AND p.approval_status = 'approved'
+       ORDER BY s.id
+       LIMIT 100
+       FOR UPDATE OF s SKIP LOCKED`,
+    )
+    for (const alert of stockAlerts.rows) {
+      if (alert.availableStock < 1) continue
+      await client.query(
+        `INSERT INTO medicine_alert_events
+           (customer_account_id, medicine_id, pharmacy_id, alert_type, status, reason)
+         VALUES ($1, $2, $3, 'stock_available', 'sent',
+                 'Sellable stock became available')`,
+        [alert.customerId, alert.medicineId, alert.pharmacyId],
+      )
+      await client.query(
+        `INSERT INTO notifications
+           (recipient_user_id, recipient_role, pharmacy_id, type, reference_type, reference_id,
+            title, message)
+         VALUES ($1, 'customer', $2, 'stock_available', 'medicine', $3,
+                 'Medicine available',
+                 $4)
+         ON CONFLICT DO NOTHING`,
+        [
+          alert.customerId,
+          alert.pharmacyId,
+          alert.medicineId,
+          `${alert.medicineName} is currently in stock at ${alert.pharmacyName}. Open the catalog to recheck availability and prescription requirements.`,
+        ],
+      )
+      await client.query(
+        `UPDATE stock_alert_subscriptions
+         SET active = false, last_sent_at = now(), updated_at = now()
+         WHERE id = $1`,
+        [alert.id],
+      )
+    }
+    await client.query('COMMIT')
+  } catch (error) {
+    if (client) await rollbackTransaction(client)
+    console.error('Medicine reminder/stock alert check failed:', error)
+  } finally {
+    client?.release()
+  }
+}
+
 try {
   await ensureAdminAccount()
   await pool.query('SELECT 1')
@@ -2917,6 +4799,12 @@ try {
     60 * 60 * 1000,
   )
   retentionTimer.unref()
+  await prepareDeliveryCodes()
+  const reminderTimer = setInterval(
+    () => void processMedicineAlerts(),
+    60 * 1000,
+  )
+  reminderTimer.unref()
   app.listen(port, '127.0.0.1', () => {
     console.log(`Pharma Plus API listening on http://127.0.0.1:${port}`)
   })

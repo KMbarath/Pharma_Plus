@@ -25,4 +25,5 @@ dist-ssr
 *.sw?
 .neon
 .devcerts/
+uploads/
 android/app/src/debug/res/raw/pharmaplus_dev_ca.pem
