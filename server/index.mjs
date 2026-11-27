@@ -1214,13 +1214,29 @@ app.put('/api/customer/profile', requireCustomer, async (request, response, next
   }
 })
 
+const inventoryTodayExpression = "(now() AT TIME ZONE 'UTC')::date"
+
+const availableStockExpression = `CASE
+  WHEN EXISTS (SELECT 1 FROM inventory_batches ib WHERE ib.medicine_id = m.id)
+    THEN LEAST(m.stock, COALESCE((
+      SELECT SUM(ib.quantity_remaining - ib.quantity_blocked)::int
+      FROM inventory_batches ib
+      WHERE ib.medicine_id = m.id
+        AND ib.quantity_remaining > ib.quantity_blocked
+        AND (ib.expiry_date IS NULL OR ib.expiry_date >= ${inventoryTodayExpression})
+    ), 0))
+  WHEN m.expiry_date IS NOT NULL AND m.expiry_date < ${inventoryTodayExpression} THEN 0
+  ELSE m.stock
+END`
+
 const medicineQuery = `
   SELECT
     m.id::int AS id, m.pharmacy_id::int AS "pharmacyId", p.name AS "pharmacyName",
     m.name, COALESCE(c.name, 'Uncategorized') AS category,
     m.brand_name AS "brandName", m.generic_name AS "genericName", m.strength,
     m.dosage_form AS "dosageForm", m.pack_quantity AS "packQuantity", m.pack_unit AS "packUnit",
-    m.pack, m.price::float8 AS price, m.stock, m.reorder_level AS "reorderLevel",
+    m.pack, m.price::float8 AS price, m.stock,
+    ${availableStockExpression}::int AS "availableQuantity", m.reorder_level AS "reorderLevel",
     to_char(m.expiry_date, 'YYYY-MM-DD') AS expiry, m.sku,
     m.manufacturer, m.batch_number AS "batchNumber", m.gst_rate::float8 AS "gstRate",
     m.hsn_code AS "hsnCode", m.prescription_required AS "prescriptionRequired",
@@ -1230,45 +1246,57 @@ const medicineQuery = `
   JOIN pharmacies p ON p.id = m.pharmacy_id
 `
 
-const availableStockExpression = `CASE
-  WHEN m.expiry_date IS NOT NULL AND m.expiry_date < CURRENT_DATE THEN 0
-  WHEN EXISTS (SELECT 1 FROM inventory_batches ib WHERE ib.medicine_id = m.id)
-    THEN LEAST(m.stock, COALESCE((
-      SELECT SUM(ib.quantity_remaining)::int
-      FROM inventory_batches ib
-      WHERE ib.medicine_id = m.id
-        AND ib.quantity_remaining > 0
-        AND (ib.expiry_date IS NULL OR ib.expiry_date >= CURRENT_DATE)
-    ), 0))
-  ELSE m.stock
-END`
-
 function medicineInput(body) {
-  const name = typeof body.name === 'string' ? body.name.trim() : ''
-  const category = typeof body.category === 'string' ? body.category.trim() : ''
-  const pack = typeof body.pack === 'string' ? body.pack.trim() : ''
-  const brandName = typeof body.brandName === 'string' ? body.brandName.trim() : ''
-  const genericName = typeof body.genericName === 'string' ? body.genericName.trim() : ''
-  const strength = typeof body.strength === 'string' ? body.strength.trim() : ''
-  const dosageForm = typeof body.dosageForm === 'string' ? body.dosageForm.trim() : ''
-  const packQuantity = Number(body.packQuantity)
-  const packUnit = typeof body.packUnit === 'string' ? body.packUnit.trim() : ''
-  const price = Number(body.price)
-  const stock = Number(body.stock)
-  const reorderLevel = Number(body.reorderLevel ?? 10)
-  const expiry = body.expiry ? String(body.expiry).slice(0, 10) : null
+  const input = body && typeof body === 'object' && !Array.isArray(body) ? body : {}
+  const name = typeof input.name === 'string' ? input.name.trim() : ''
+  const category = typeof input.category === 'string' ? input.category.trim() : ''
+  const pack = typeof input.pack === 'string' ? input.pack.trim() : ''
+  const brandName = typeof input.brandName === 'string' ? input.brandName.trim() : ''
+  const genericName = typeof input.genericName === 'string' ? input.genericName.trim() : ''
+  const strength = typeof input.strength === 'string' ? input.strength.trim() : ''
+  const dosageForm = typeof input.dosageForm === 'string' ? input.dosageForm.trim() : ''
+  const packQuantity = Number(input.packQuantity)
+  const packUnit = typeof input.packUnit === 'string' ? input.packUnit.trim() : ''
+  const price = Number(input.price)
+  const stock = Number(input.stock)
+  const reorderLevel = Number(input.reorderLevel ?? 10)
+  const expiry = input.expiry ? String(input.expiry).slice(0, 10) : null
+  const sku = typeof input.sku === 'string' ? input.sku.trim() : ''
+  const batchNumber = typeof input.batchNumber === 'string' ? input.batchNumber.trim() : ''
+  const hsnCode = typeof input.hsnCode === 'string' ? input.hsnCode.trim() : ''
+  const imageUrl = typeof input.imageUrl === 'string' ? input.imageUrl.trim() : ''
 
   if (!name || !category || !pack || !brandName || !genericName || !strength || !dosageForm || !packUnit) {
     return { error: 'Name, category, pack label, brand, generic ingredient, strength, dosage form, and pack unit are required.' }
   }
+  if ([name, category, pack, brandName, genericName, strength, dosageForm, packUnit].some((value) => value.length > 200)) {
+    return { error: 'Medicine details must be 200 characters or fewer.' }
+  }
   if (!Number.isSafeInteger(packQuantity) || packQuantity < 1 || packQuantity > 100000) {
     return { error: 'Pack quantity must be a whole number between 1 and 100000.' }
   }
-  if (!Number.isFinite(price) || price < 0 || !Number.isInteger(stock) || stock < 0) {
-    return { error: 'Price must be non-negative and stock must be a non-negative whole number.' }
+  if (!Number.isFinite(price) || price < 0 || price > 9999999999.99 ||
+      Math.abs(price * 100 - Math.round(price * 100)) > 0.000001) {
+    return { error: 'Price must be a non-negative amount with no more than two decimal places.' }
   }
-  if (!Number.isInteger(reorderLevel) || reorderLevel < 0) {
-    return { error: 'Reorder level must be a non-negative whole number.' }
+  if (!Number.isSafeInteger(stock) || stock < 0 || stock > 2147483647) {
+    return { error: 'Stock must be a non-negative whole number within the supported range.' }
+  }
+  if (!Number.isSafeInteger(reorderLevel) || reorderLevel < 0 || reorderLevel > 2147483647) {
+    return { error: 'Reorder level must be a non-negative whole number within the supported range.' }
+  }
+  if (sku && (sku.length > 100 || !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(sku))) {
+    return { error: 'SKU must start with a letter or number and contain only letters, numbers, dots, underscores, slashes, or hyphens.' }
+  }
+  if (batchNumber && (batchNumber.length > 100 || !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(batchNumber))) {
+    return { error: 'Batch number must start with a letter or number and contain only letters, numbers, dots, underscores, slashes, or hyphens.' }
+  }
+  if (hsnCode && !/^(?:\d{4}|\d{6}|\d{8})$/.test(hsnCode)) {
+    return { error: 'HSN code must contain 4, 6, or 8 digits.' }
+  }
+  if (imageUrl.length > 2048 ||
+      (imageUrl && !isValidProductImageUrl(imageUrl))) {
+    return { error: 'Image URL must be a secure HTTPS URL or a valid application image path.' }
   }
   const parsedExpiry = expiry ? new Date(`${expiry}T00:00:00.000Z`) : null
   if (
@@ -1295,16 +1323,109 @@ function medicineInput(body) {
       stock,
       reorderLevel,
       expiry,
-      sku: typeof body.sku === 'string' && body.sku.trim() ? body.sku.trim() : null,
-      manufacturer: typeof body.manufacturer === 'string' ? body.manufacturer.trim() || null : null,
-      batchNumber: typeof body.batchNumber === 'string' ? body.batchNumber.trim() || null : null,
-      gstRate: Number(body.gstRate ?? 0),
-      hsnCode: typeof body.hsnCode === 'string' ? body.hsnCode.trim() || null : null,
-      prescriptionRequired: body.prescriptionRequired === true,
-      description: typeof body.description === 'string' ? body.description.trim() || null : null,
-      imageUrl: typeof body.imageUrl === 'string' ? body.imageUrl.trim() || null : null,
+      sku: sku || null,
+      manufacturer: typeof input.manufacturer === 'string' ? input.manufacturer.trim() || null : null,
+      batchNumber: batchNumber || null,
+      gstRate: Number(input.gstRate ?? 0),
+      hsnCode: hsnCode || null,
+      prescriptionRequired: input.prescriptionRequired === true,
+      description: typeof input.description === 'string' ? input.description.trim() || null : null,
+      imageUrl: imageUrl || null,
     },
   }
+}
+
+function isValidProductImageUrl(imageUrl) {
+  if (imageUrl.startsWith('/') && !imageUrl.startsWith('//') && !imageUrl.includes('\\')) {
+    return !imageUrl.split('/').includes('..')
+  }
+  try {
+    const url = new URL(imageUrl)
+    return url.protocol === 'https:' && !url.username && !url.password
+  } catch {
+    return false
+  }
+}
+
+function medicineIdFromRoute(rawId) {
+  if (typeof rawId !== 'string' || !/^[1-9]\d*$/.test(rawId)) return null
+  const id = Number(rawId)
+  return Number.isSafeInteger(id) ? id : null
+}
+
+function stockReceiptInput(body) {
+  const input = body && typeof body === 'object' && !Array.isArray(body) ? body : {}
+  const medicineId = input.medicineId
+  const supplierName = typeof input.supplierName === 'string' ? input.supplierName.trim() : ''
+  const batchNumber = typeof input.batchNumber === 'string' ? input.batchNumber.trim() : ''
+  const quantityReceived = typeof input.quantityReceived === 'number' ||
+    (typeof input.quantityReceived === 'string' && input.quantityReceived.trim() !== '')
+    ? Number(input.quantityReceived)
+    : Number.NaN
+  const purchasePrice = typeof input.purchasePrice === 'number' ||
+    (typeof input.purchasePrice === 'string' && input.purchasePrice.trim() !== '')
+    ? Number(input.purchasePrice)
+    : Number.NaN
+  const expiryDate = typeof input.expiryDate === 'string' ? input.expiryDate.trim() : ''
+  const parsedExpiry = expiryDate ? new Date(`${expiryDate}T00:00:00.000Z`) : null
+
+  if (!Number.isSafeInteger(medicineId) || medicineId < 1) {
+    return { error: 'Choose a valid medicine for this receipt.' }
+  }
+  if (!supplierName || supplierName.length > 200) {
+    return { error: 'Supplier name is required and must be 200 characters or fewer.' }
+  }
+  if (batchNumber.length > 100 || !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(batchNumber)) {
+    return { error: 'Lot number must start with a letter or number and contain only letters, numbers, dots, underscores, slashes, or hyphens.' }
+  }
+  if (!Number.isSafeInteger(quantityReceived) || quantityReceived < 1 || quantityReceived > 2147483647) {
+    return { error: 'Received quantity must be a positive whole number within the supported range.' }
+  }
+  if (!Number.isFinite(purchasePrice) || purchasePrice < 0 || purchasePrice > 9999999999.99 ||
+      Math.abs(purchasePrice * 100 - Math.round(purchasePrice * 100)) > 0.000001) {
+    return { error: 'Purchase price must be a non-negative amount with no more than two decimal places.' }
+  }
+  if (
+    !/^\d{4}-\d{2}-\d{2}$/.test(expiryDate) ||
+    Number.isNaN(parsedExpiry?.getTime()) ||
+    parsedExpiry?.toISOString().slice(0, 10) !== expiryDate
+  ) {
+    return { error: 'Expiry date must be a valid YYYY-MM-DD date.' }
+  }
+
+  return { value: { medicineId, supplierName, batchNumber, quantityReceived, purchasePrice, expiryDate } }
+}
+
+function inventoryAuditInput(body) {
+  const input = body && typeof body === 'object' && !Array.isArray(body) ? body : {}
+  const reason = typeof input.reason === 'string' ? input.reason.trim() : ''
+  if (reason.length < 3 || reason.length > 1000) {
+    return { error: 'Provide an inventory count reason between 3 and 1000 characters.' }
+  }
+  if (!Array.isArray(input.items) || input.items.length < 1 || input.items.length > 100) {
+    return { error: 'Count between 1 and 100 inventory batches per session.' }
+  }
+
+  const items = input.items.map((item) => ({
+    medicineId: item?.medicineId,
+    batchId: item?.batchId,
+    countedQuantity: item?.countedQuantity,
+    countedSellableQuantity: item?.countedSellableQuantity,
+  }))
+  if (items.some((item) =>
+    !Number.isSafeInteger(item.medicineId) || item.medicineId < 1 ||
+    !Number.isSafeInteger(item.batchId) || item.batchId < 1 ||
+    !Number.isSafeInteger(item.countedQuantity) || item.countedQuantity < 0 || item.countedQuantity > 2147483647 ||
+    !Number.isSafeInteger(item.countedSellableQuantity) || item.countedSellableQuantity < 0 ||
+    item.countedSellableQuantity > item.countedQuantity
+  )) {
+    return { error: 'Each batch needs valid non-negative physical and sellable counted quantities.' }
+  }
+  if (new Set(items.map((item) => item.batchId)).size !== items.length) {
+    return { error: 'A batch can appear only once in an inventory count session.' }
+  }
+
+  return { value: { reason, items } }
 }
 
 async function categoryId(client, name) {
@@ -1332,7 +1453,8 @@ async function createInventoryBatch(client, medicineId, item, quantity, batchNum
 async function setInventoryBatchesToStock(client, medicineId, item) {
   const batches = await client.query(
     `SELECT id::int AS id, batch_number AS "batchNumber", quantity_received AS "quantityReceived",
-       quantity_remaining AS "quantityRemaining", expiry_date::text AS expiry
+       quantity_remaining AS "quantityRemaining", quantity_blocked AS "quantityBlocked",
+       expiry_date::text AS expiry
      FROM inventory_batches
      WHERE medicine_id = $1
      ORDER BY expiry_date ASC NULLS LAST, received_at ASC, id ASC
@@ -1377,9 +1499,13 @@ async function setInventoryBatchesToStock(client, medicineId, item) {
       if (difference === 0) break
       const quantityChange = Math.min(difference, batch.quantityRemaining)
       if (!quantityChange) continue
+      const blockedReduction = Math.min(batch.quantityBlocked, quantityChange)
       await client.query(
-        'UPDATE inventory_batches SET quantity_remaining = quantity_remaining - $2 WHERE id = $1',
-        [batch.id, quantityChange],
+        `UPDATE inventory_batches
+         SET quantity_remaining = quantity_remaining - $2,
+             quantity_blocked = quantity_blocked - $3
+         WHERE id = $1`,
+        [batch.id, quantityChange, blockedReduction],
       )
       changes.push({ batchId: batch.id, quantityChange: -quantityChange })
       difference -= quantityChange
@@ -1746,11 +1872,11 @@ app.get('/api/catalog/compare', async (request, response, next) => {
          LEFT JOIN categories c ON c.id = m.category_id
          LEFT JOIN pharmacy_settings ps ON ps.setting_key = 'marketplace:' || p.id::text
          WHERE m.is_active
-           AND lower(btrim(m.brand_name)) = lower(btrim($2)) AND
-             lower(btrim(m.generic_name)) = lower(btrim($3)) AND
-             lower(btrim(m.strength)) = lower(btrim($4)) AND
-             lower(btrim(m.dosage_form)) = lower(btrim($5)) AND
-             m.pack_quantity = $6 AND lower(btrim(m.pack_unit)) = lower(btrim($7))
+           AND lower(btrim(m.brand_name)) = lower(btrim($1)) AND
+             lower(btrim(m.generic_name)) = lower(btrim($2)) AND
+             lower(btrim(m.strength)) = lower(btrim($3)) AND
+             lower(btrim(m.dosage_form)) = lower(btrim($4)) AND
+             m.pack_quantity = $5 AND lower(btrim(m.pack_unit)) = lower(btrim($6))
          ORDER BY m.price, p.name`,
         [identity.brandName, identity.genericName, identity.strength, identity.dosageForm,
           identity.packQuantity, identity.packUnit],
@@ -1908,8 +2034,8 @@ app.get('/api/medicines/:id', async (request, response, next) => {
         m.dosage_form AS "dosageForm", m.pack_quantity AS "packQuantity", m.pack_unit AS "packUnit",
         m.pack, m.price::float8 AS price, m.stock, m.reorder_level AS "reorderLevel",
         ${availableStockExpression}::int AS "availableStock",
-        m.expiry_date AS "expiryDate", (m.expiry_date < CURRENT_DATE) AS "isExpired",
-        (m.expiry_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '30 days') AS "expiresSoon",
+        m.expiry_date::text AS "expiryDate", (m.expiry_date < ${inventoryTodayExpression}) AS "isExpired",
+        (m.expiry_date BETWEEN ${inventoryTodayExpression} AND ${inventoryTodayExpression} + 30) AS "expiresSoon",
         m.manufacturer, m.batch_number AS "batchNumber",
         m.gst_rate::float8 AS "gstRate", m.hsn_code AS "hsnCode",
         m.prescription_required AS "prescriptionRequired", m.description,
@@ -1919,7 +2045,7 @@ app.get('/api/medicines/:id', async (request, response, next) => {
         EXISTS (SELECT 1 FROM inventory_batches ib WHERE ib.medicine_id = m.id) AS "hasBatches",
         COALESCE((SELECT SUM(ib.quantity_remaining)::int FROM inventory_batches ib
           WHERE ib.medicine_id = m.id AND ib.quantity_remaining > 0
-            AND ib.expiry_date IS NOT NULL AND ib.expiry_date < CURRENT_DATE), 0)::int AS "expiredBatchQuantity"
+            AND ib.expiry_date IS NOT NULL AND ib.expiry_date < ${inventoryTodayExpression}), 0)::int AS "expiredBatchQuantity"
        FROM medicines m
        JOIN pharmacies p ON p.id = m.pharmacy_id AND p.approval_status = 'approved'
        LEFT JOIN categories c ON c.id = m.category_id
@@ -2058,7 +2184,7 @@ app.delete('/api/me/favorites/:medicineId', requireCustomer, async (request, res
   }
 })
 
-app.get('/api/medicines', requireOwner, async (request, response, next) => {
+async function listOwnerMedicines(request, response, next) {
   try {
     const result = await pool.query(
       `${medicineQuery} WHERE m.pharmacy_id = $1 AND m.is_active ORDER BY m.name`,
@@ -2067,6 +2193,265 @@ app.get('/api/medicines', requireOwner, async (request, response, next) => {
     response.json(result.rows)
   } catch (error) {
     next(error)
+  }
+}
+
+app.get('/api/medicines', requireOwner, listOwnerMedicines)
+app.get('/api/owner/medicines', requireOwner, listOwnerMedicines)
+
+app.get('/api/owner/medicines/:id/batches', requireOwner, async (request, response, next) => {
+  const medicineId = medicineIdFromRoute(request.params.id)
+  if (medicineId === null) return response.status(400).json({ error: 'Invalid medicine ID.' })
+  try {
+    const result = await pool.query(
+      `SELECT b.id::int AS id, b.medicine_id::int AS "medicineId",
+         b.batch_number AS "batchNumber", s.name AS "supplierName",
+         b.quantity_received::int AS "quantityReceived",
+         b.quantity_remaining::int AS "quantityRemaining",
+         b.quantity_blocked::int AS "quantityBlocked",
+         CASE WHEN b.expiry_date IS NOT NULL AND b.expiry_date < ${inventoryTodayExpression}
+           THEN 0 ELSE (b.quantity_remaining - b.quantity_blocked)::int
+         END AS "sellableQuantity",
+         b.purchase_price::float8 AS "purchasePrice",
+         to_char(b.expiry_date, 'YYYY-MM-DD') AS "expiryDate",
+         b.received_at AS "receivedAt",
+         (b.expiry_date IS NOT NULL AND b.expiry_date < ${inventoryTodayExpression}) AS "isExpired",
+         ((b.quantity_remaining > b.quantity_blocked)
+           AND (b.expiry_date IS NULL OR b.expiry_date >= ${inventoryTodayExpression})) AS "isSellable"
+       FROM inventory_batches b
+       JOIN medicines m ON m.id = b.medicine_id
+       LEFT JOIN suppliers s
+         ON s.id = b.supplier_id AND (s.pharmacy_id = m.pharmacy_id OR s.pharmacy_id IS NULL)
+       WHERE b.medicine_id = $1 AND m.pharmacy_id = $2
+       ORDER BY b.expiry_date ASC NULLS LAST, b.received_at ASC, b.id ASC`,
+      [medicineId, request.user.pharmacyId],
+    )
+    if (!result.rowCount) {
+      const medicine = await pool.query(
+        'SELECT 1 FROM medicines WHERE id = $1 AND pharmacy_id = $2',
+        [medicineId, request.user.pharmacyId],
+      )
+      if (!medicine.rowCount) return response.status(404).json({ error: 'Medicine was not found.' })
+    }
+    response.json(result.rows)
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.post('/api/owner/stock/receipts', requireOwner, async (request, response, next) => {
+  const parsed = stockReceiptInput(request.body)
+  if (parsed.error) return response.status(400).json({ error: parsed.error })
+  const receipt = parsed.value
+  let client
+  try {
+    client = await pool.connect()
+    await client.query('BEGIN')
+    const medicine = await client.query(
+      `SELECT id FROM medicines
+       WHERE id = $1 AND pharmacy_id = $2 AND is_active
+       FOR UPDATE`,
+      [receipt.medicineId, request.user.pharmacyId],
+    )
+    if (!medicine.rowCount) {
+      await client.query('ROLLBACK')
+      return response.status(404).json({ error: 'Medicine was not found in this pharmacy.' })
+    }
+
+    const duplicate = await client.query(
+      'SELECT 1 FROM inventory_batches WHERE medicine_id = $1 AND batch_number = $2',
+      [receipt.medicineId, receipt.batchNumber],
+    )
+    if (duplicate.rowCount) {
+      await client.query('ROLLBACK')
+      return response.status(409).json({ error: 'This lot number has already been received for this medicine.' })
+    }
+
+    const supplier = await client.query(
+      `INSERT INTO suppliers (pharmacy_id, name)
+       VALUES ($1, $2)
+       ON CONFLICT (pharmacy_id, name) DO UPDATE SET updated_at = now()
+       RETURNING id::int AS id`,
+      [request.user.pharmacyId, receipt.supplierName],
+    )
+    const batch = await client.query(
+      `INSERT INTO inventory_batches
+        (medicine_id, supplier_id, batch_number, quantity_received, quantity_remaining, purchase_price, expiry_date)
+       VALUES ($1, $2, $3, $4, $4, $5, $6)
+       RETURNING id::int AS id`,
+      [receipt.medicineId, supplier.rows[0].id, receipt.batchNumber,
+        receipt.quantityReceived, receipt.purchasePrice, receipt.expiryDate],
+    )
+    const stockTotal = await client.query(
+      `SELECT COALESCE(SUM(quantity_remaining), 0)::bigint AS total
+       FROM inventory_batches WHERE medicine_id = $1`,
+      [receipt.medicineId],
+    )
+    const stock = Number(stockTotal.rows[0].total)
+    if (!Number.isSafeInteger(stock) || stock > 2147483647) {
+      await client.query('ROLLBACK')
+      return response.status(409).json({ error: 'This receipt would exceed the supported inventory quantity.' })
+    }
+    await client.query(
+      `UPDATE medicines SET stock = $2, updated_at = now()
+       WHERE id = $1 AND pharmacy_id = $3 AND is_active`,
+      [receipt.medicineId, stock, request.user.pharmacyId],
+    )
+    const movementNote = `Supplier receipt from ${receipt.supplierName}; lot ${receipt.batchNumber}; purchase price ${receipt.purchasePrice.toFixed(2)}`
+    await client.query(
+      `INSERT INTO stock_movements (medicine_id, inventory_batch_id, movement_type, quantity_change, note)
+       VALUES ($1, $2, 'purchase', $3, $4)`,
+      [receipt.medicineId, batch.rows[0].id, receipt.quantityReceived, movementNote],
+    )
+    await client.query(
+      `INSERT INTO audit_events (actor, action, entity_type, entity_id, details)
+       VALUES ($1, 'stock_received', 'inventory_batch', $2, $3::jsonb)`,
+      [request.user.email, batch.rows[0].id, JSON.stringify({
+        pharmacyId: request.user.pharmacyId,
+        medicineId: receipt.medicineId,
+        supplierId: supplier.rows[0].id,
+        supplierName: receipt.supplierName,
+        batchNumber: receipt.batchNumber,
+        quantityReceived: receipt.quantityReceived,
+        purchasePrice: receipt.purchasePrice,
+        expiryDate: receipt.expiryDate,
+      })],
+    )
+    await client.query('COMMIT')
+    response.status(201).json({
+      medicineId: receipt.medicineId,
+      batchId: batch.rows[0].id,
+      stock,
+    })
+  } catch (error) {
+    if (client) await rollbackTransaction(client)
+    if (error?.code === '23505' && error.constraint === 'inventory_batches_medicine_id_batch_number_key') {
+      return response.status(409).json({ error: 'This lot number has already been received for this medicine.' })
+    }
+    next(error)
+  } finally {
+    client?.release()
+  }
+})
+
+app.post('/api/owner/inventory-audits', requireOwner, async (request, response, next) => {
+  const parsed = inventoryAuditInput(request.body)
+  if (parsed.error) return response.status(400).json({ error: parsed.error })
+  const audit = parsed.value
+  const sessionId = randomUUID()
+  let client
+  try {
+    client = await pool.connect()
+    await client.query('BEGIN')
+    const batchIds = audit.items.map((item) => item.batchId)
+    const currentBatches = await client.query(
+      `SELECT b.id::int AS "batchId", b.medicine_id::int AS "medicineId",
+         b.quantity_remaining::int AS "systemQuantity",
+         CASE WHEN b.expiry_date IS NOT NULL AND b.expiry_date < ${inventoryTodayExpression}
+           THEN 0 ELSE (b.quantity_remaining - b.quantity_blocked)::int
+         END AS "systemSellableQuantity",
+         (b.expiry_date IS NOT NULL AND b.expiry_date < ${inventoryTodayExpression}) AS "isExpired"
+       FROM inventory_batches b
+       JOIN medicines m ON m.id = b.medicine_id
+       WHERE b.id = ANY($1::bigint[]) AND m.pharmacy_id = $2 AND m.is_active
+       ORDER BY m.id, b.expiry_date ASC NULLS LAST, b.received_at, b.id
+       FOR UPDATE OF m, b`,
+      [batchIds, request.user.pharmacyId],
+    )
+    if (currentBatches.rowCount !== audit.items.length) {
+      await client.query('ROLLBACK')
+      return response.status(404).json({ error: 'One or more inventory batches were not found in this pharmacy.' })
+    }
+
+    const currentByBatchId = new Map(currentBatches.rows.map((batch) => [batch.batchId, batch]))
+    for (const item of audit.items) {
+      const current = currentByBatchId.get(item.batchId)
+      if (current.medicineId !== item.medicineId) {
+        await client.query('ROLLBACK')
+        return response.status(404).json({ error: 'A counted batch does not belong to the selected medicine.' })
+      }
+      if (current.isExpired && item.countedSellableQuantity > 0) {
+        await client.query('ROLLBACK')
+        return response.status(400).json({ error: 'Expired inventory cannot be marked sellable.' })
+      }
+    }
+
+    const medicineIds = [...new Set(audit.items.map((item) => item.medicineId))]
+    const savedItems = []
+    for (const item of audit.items) {
+      const current = currentByBatchId.get(item.batchId)
+      const quantityChange = item.countedQuantity - current.systemQuantity
+      const sellableQuantityChange = item.countedSellableQuantity - current.systemSellableQuantity
+      const quantityBlocked = item.countedQuantity - item.countedSellableQuantity
+      await client.query(
+        `UPDATE inventory_batches
+         SET quantity_remaining = $2, quantity_blocked = $3
+         WHERE id = $1`,
+        [item.batchId, item.countedQuantity, quantityBlocked],
+      )
+      await client.query(
+        `INSERT INTO inventory_audits
+          (session_id, pharmacy_id, medicine_id, inventory_batch_id,
+           system_quantity, counted_quantity, quantity_change,
+           system_sellable_quantity, counted_sellable_quantity, sellable_quantity_change,
+           reason, authorizer_user_id, authorizer_name)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+        [sessionId, request.user.pharmacyId, item.medicineId, item.batchId,
+          current.systemQuantity, item.countedQuantity, quantityChange,
+          current.systemSellableQuantity, item.countedSellableQuantity, sellableQuantityChange,
+          audit.reason, request.user.id, request.user.fullName],
+      )
+      if (quantityChange !== 0 || sellableQuantityChange !== 0) {
+        const movementQuantity = quantityChange !== 0 ? quantityChange : sellableQuantityChange
+        await client.query(
+          `INSERT INTO stock_movements (medicine_id, inventory_batch_id, movement_type, quantity_change, note)
+           VALUES ($1, $2, 'adjustment', $3, $4)`,
+          [item.medicineId, item.batchId, movementQuantity,
+            `Inventory count ${sessionId}; ${audit.reason}; sellable ${current.systemSellableQuantity} -> ${item.countedSellableQuantity}`],
+        )
+      }
+      savedItems.push({
+        medicineId: item.medicineId,
+        batchId: item.batchId,
+        systemQuantity: current.systemQuantity,
+        countedQuantity: item.countedQuantity,
+        quantityChange,
+        systemSellableQuantity: current.systemSellableQuantity,
+        countedSellableQuantity: item.countedSellableQuantity,
+        sellableQuantityChange,
+      })
+    }
+
+    const totals = await client.query(
+      `SELECT medicine_id::int AS "medicineId", COALESCE(SUM(quantity_remaining), 0)::bigint AS stock
+       FROM inventory_batches
+       WHERE medicine_id = ANY($1::bigint[])
+       GROUP BY medicine_id`,
+      [medicineIds],
+    )
+    if (totals.rows.some((row) => Number(row.stock) > 2147483647)) {
+      await client.query('ROLLBACK')
+      return response.status(409).json({ error: 'The inventory count exceeds the supported medicine quantity.' })
+    }
+    for (const total of totals.rows) {
+      await client.query(
+        `UPDATE medicines SET stock = $2, updated_at = now()
+         WHERE id = $1 AND pharmacy_id = $3`,
+        [total.medicineId, Number(total.stock), request.user.pharmacyId],
+      )
+    }
+    await client.query('COMMIT')
+    response.status(201).json({
+      sessionId,
+      reason: audit.reason,
+      authorizer: request.user.fullName,
+      adjustments: savedItems,
+    })
+  } catch (error) {
+    if (client) await rollbackTransaction(client)
+    next(error)
+  } finally {
+    client?.release()
   }
 })
 
@@ -2103,10 +2488,11 @@ app.post(
   },
 )
 
-app.post('/api/medicines', requireOwner, async (request, response, next) => {
+async function createOwnerMedicine(request, response, next) {
   const parsed = medicineInput(request.body)
   if (parsed.error) return response.status(400).json({ error: parsed.error })
-  if (!Number.isFinite(parsed.value.gstRate) || parsed.value.gstRate < 0 || parsed.value.gstRate > 100) {
+  if (!Number.isFinite(parsed.value.gstRate) || parsed.value.gstRate < 0 || parsed.value.gstRate > 100 ||
+      Math.abs(parsed.value.gstRate * 100 - Math.round(parsed.value.gstRate * 100)) > 0.000001) {
     return response.status(400).json({ error: 'GST rate must be between 0 and 100.' })
   }
 
@@ -2145,6 +2531,11 @@ app.post('/api/medicines', requireOwner, async (request, response, next) => {
         [id, batchId, item.stock],
       )
     }
+    await client.query(
+      `INSERT INTO audit_events (actor, action, entity_type, entity_id, details)
+       VALUES ($1, 'medicine_created', 'medicine', $2, $3::jsonb)`,
+      [request.user.email, id, JSON.stringify({ pharmacyId: request.user.pharmacyId, sku: item.sku })],
+    )
     const result = await client.query(
       `${medicineQuery} WHERE m.id = $1 AND m.pharmacy_id = $2`,
       [id, request.user.pharmacyId],
@@ -2157,14 +2548,18 @@ app.post('/api/medicines', requireOwner, async (request, response, next) => {
   } finally {
     client?.release()
   }
-})
+}
 
-app.put('/api/medicines/:id', requireOwner, async (request, response, next) => {
-  const id = Number(request.params.id)
+app.post('/api/medicines', requireOwner, createOwnerMedicine)
+app.post('/api/owner/medicines', requireOwner, createOwnerMedicine)
+
+async function updateOwnerMedicine(request, response, next) {
+  const id = medicineIdFromRoute(request.params.id)
   const parsed = medicineInput(request.body)
-  if (!Number.isSafeInteger(id) || id < 1) return response.status(400).json({ error: 'Invalid medicine ID.' })
+  if (id === null) return response.status(400).json({ error: 'Invalid medicine ID.' })
   if (parsed.error) return response.status(400).json({ error: parsed.error })
-  if (!Number.isFinite(parsed.value.gstRate) || parsed.value.gstRate < 0 || parsed.value.gstRate > 100) {
+  if (!Number.isFinite(parsed.value.gstRate) || parsed.value.gstRate < 0 || parsed.value.gstRate > 100 ||
+      Math.abs(parsed.value.gstRate * 100 - Math.round(parsed.value.gstRate * 100)) > 0.000001) {
     return response.status(400).json({ error: 'GST rate must be between 0 and 100.' })
   }
 
@@ -2173,7 +2568,7 @@ app.put('/api/medicines/:id', requireOwner, async (request, response, next) => {
     client = await pool.connect()
     await client.query('BEGIN')
     const existing = await client.query(
-      'SELECT id FROM medicines WHERE id = $1 AND pharmacy_id = $2 AND is_active FOR UPDATE',
+      'SELECT id, price::text AS price FROM medicines WHERE id = $1 AND pharmacy_id = $2 AND is_active FOR UPDATE',
       [id, request.user.pharmacyId],
     )
     if (!existing.rowCount) {
@@ -2198,6 +2593,23 @@ app.put('/api/medicines/:id', requireOwner, async (request, response, next) => {
         item.expiry, item.price, item.stock, item.reorderLevel, item.gstRate, item.hsnCode,
         item.prescriptionRequired, item.description, item.imageUrl, request.user.pharmacyId],
     )
+    const priceChanged = Number(existing.rows[0].price) !== item.price
+    await client.query(
+      `INSERT INTO audit_events (actor, action, entity_type, entity_id, details)
+       VALUES ($1, 'medicine_updated', 'medicine', $2, $3::jsonb)`,
+      [request.user.email, id, JSON.stringify({ pharmacyId: request.user.pharmacyId, priceChanged })],
+    )
+    if (priceChanged) {
+      await client.query(
+        `INSERT INTO audit_events (actor, action, entity_type, entity_id, details)
+         VALUES ($1, 'medicine_price_changed', 'medicine', $2, $3::jsonb)`,
+        [request.user.email, id, JSON.stringify({
+          pharmacyId: request.user.pharmacyId,
+          fromPrice: Number(existing.rows[0].price),
+          toPrice: item.price,
+        })],
+      )
+    }
     const result = await client.query(
       `${medicineQuery} WHERE m.id = $1 AND m.pharmacy_id = $2`,
       [id, request.user.pharmacyId],
@@ -2210,24 +2622,46 @@ app.put('/api/medicines/:id', requireOwner, async (request, response, next) => {
   } finally {
     client?.release()
   }
-})
+}
 
-app.delete('/api/medicines/:id', requireOwner, async (request, response, next) => {
-  const id = Number(request.params.id)
-  if (!Number.isSafeInteger(id) || id < 1) return response.status(400).json({ error: 'Invalid medicine ID.' })
+app.put('/api/medicines/:id', requireOwner, updateOwnerMedicine)
+app.patch('/api/medicines/:id', requireOwner, updateOwnerMedicine)
+app.patch('/api/owner/medicines/:id', requireOwner, updateOwnerMedicine)
 
+async function deactivateOwnerMedicine(request, response, next) {
+  const id = medicineIdFromRoute(request.params.id)
+  if (id === null) return response.status(400).json({ error: 'Invalid medicine ID.' })
+
+  let client
   try {
-    const result = await pool.query(
+    client = await pool.connect()
+    await client.query('BEGIN')
+    const result = await client.query(
       `UPDATE medicines SET is_active = false, updated_at = now()
        WHERE id = $1 AND pharmacy_id = $2 AND is_active`,
       [id, request.user.pharmacyId],
     )
-    if (!result.rowCount) return response.status(404).json({ error: 'Medicine was not found.' })
+    if (!result.rowCount) {
+      await client.query('ROLLBACK')
+      return response.status(404).json({ error: 'Medicine was not found.' })
+    }
+    await client.query(
+      `INSERT INTO audit_events (actor, action, entity_type, entity_id, details)
+       VALUES ($1, 'medicine_deactivated', 'medicine', $2, $3::jsonb)`,
+      [request.user.email, id, JSON.stringify({ pharmacyId: request.user.pharmacyId })],
+    )
+    await client.query('COMMIT')
     response.status(204).end()
   } catch (error) {
+    if (client) await client.query('ROLLBACK')
     next(error)
+  } finally {
+    client?.release()
   }
-})
+}
+
+app.delete('/api/medicines/:id', requireOwner, deactivateOwnerMedicine)
+app.post('/api/owner/medicines/:id/deactivate', requireOwner, deactivateOwnerMedicine)
 
 app.post('/api/me/prescriptions', requireCustomer, prescriptionUpload.single('file'), async (request, response, next) => {
   const fileError = validatePrescriptionFile(request.file)
@@ -2616,6 +3050,7 @@ const orderSelect = `
     o.created_at AS "createdAt", o.updated_at AS "updatedAt",
     COALESCE((
       SELECT json_agg(json_build_object(
+        'orderItemId', i.id::int,
         'medicineId', i.medicine_id::int, 'name', i.medicine_name, 'quantity', i.quantity,
         'packQuantity', i.pack_quantity_at_order, 'baseUnitQuantity', i.base_unit_quantity,
         'baseUnitName', i.base_unit_name,
@@ -2636,7 +3071,35 @@ const orderSelect = `
         'note', e.note
       ) ORDER BY e.created_at, e.id)
       FROM order_status_events e WHERE e.order_id = o.id
-    ), '[]'::json) AS events
+    ), '[]'::json) AS events,
+    COALESCE((
+      SELECT json_agg(json_build_object(
+        'id', r.id::int,
+        'type', r.request_type,
+        'status', r.status,
+        'reason', r.reason,
+        'decisionReason', r.decision_reason,
+        'refundAmount', r.refund_amount::float8,
+        'refundStatus', r.refund_status,
+        'createdAt', r.created_at,
+        'items', COALESCE((
+          SELECT json_agg(json_build_object(
+            'id', ri.id::int,
+            'orderItemId', ri.order_item_id::int,
+            'name', i.medicine_name,
+            'requestedQuantity', ri.requested_quantity,
+            'receivedQuantity', ri.received_quantity,
+            'disposition', ri.disposition,
+            'restockSellable', ri.restock_sellable,
+            'prescriptionRequired', i.prescription_required_at_order
+          ) ORDER BY ri.id)
+          FROM customer_return_items ri
+          JOIN sales_order_items i ON i.id = ri.order_item_id
+          WHERE ri.return_id = r.id
+        ), '[]'::json)
+      ) ORDER BY r.created_at, r.id)
+      FROM customer_returns r WHERE r.order_id = o.id
+    ), '[]'::json) AS "returnRequests"
   FROM sales_orders o
   JOIN pharmacies p ON p.id = o.pharmacy_id
   LEFT JOIN customers c ON c.id = o.customer_id
@@ -3163,10 +3626,11 @@ async function placeLegacyOrder(request, response, next) {
     }
 
     const batches = await client.query(
-      `SELECT id::int AS id, medicine_id::int AS "medicineId", quantity_remaining AS "quantityRemaining"
+      `SELECT id::int AS id, medicine_id::int AS "medicineId",
+         (quantity_remaining - quantity_blocked)::int AS "quantityRemaining"
        FROM inventory_batches
-       WHERE medicine_id = ANY($1::bigint[]) AND quantity_remaining > 0
-         AND (expiry_date IS NULL OR expiry_date >= CURRENT_DATE)
+       WHERE medicine_id = ANY($1::bigint[]) AND quantity_remaining > quantity_blocked
+         AND (expiry_date IS NULL OR expiry_date >= ${inventoryTodayExpression})
        ORDER BY medicine_id, expiry_date ASC NULLS LAST, received_at ASC, id ASC
        FOR UPDATE`,
       [medicineIds],
@@ -3227,7 +3691,7 @@ async function placeLegacyOrder(request, response, next) {
         const quantity = Math.min(remaining, batch.quantityRemaining)
         const deduction = await client.query(
           `UPDATE inventory_batches SET quantity_remaining = quantity_remaining - $2
-           WHERE id = $1 AND quantity_remaining >= $2 RETURNING id`,
+           WHERE id = $1 AND quantity_remaining - quantity_blocked >= $2 RETURNING id`,
           [batch.id, quantity],
         )
         if (!deduction.rowCount) throw new ApiError(409, 'Inventory changed while placing the order.', 'INVENTORY_CHANGED')
@@ -3456,10 +3920,10 @@ app.post(['/api/orders', '/api/customer/orders'], requireCustomer, async (reques
       }
       if (medicine.hasBatches) {
         const batches = await client.query(
-          `SELECT id::int AS id, quantity_remaining AS quantity
+          `SELECT id::int AS id, (quantity_remaining - quantity_blocked)::int AS quantity
            FROM inventory_batches
-           WHERE medicine_id = $1 AND quantity_remaining > 0
-             AND (expiry_date IS NULL OR expiry_date >= CURRENT_DATE)
+           WHERE medicine_id = $1 AND quantity_remaining > quantity_blocked
+             AND (expiry_date IS NULL OR expiry_date >= ${inventoryTodayExpression})
            ORDER BY expiry_date ASC NULLS LAST, received_at, id
            FOR UPDATE`,
           [line.medicineId],
@@ -3469,7 +3933,8 @@ app.post(['/api/orders', '/api/customer/orders'], requireCustomer, async (reques
           if (remaining === 0) break
           const quantity = Math.min(remaining, batch.quantity)
           await client.query(
-            'UPDATE inventory_batches SET quantity_remaining = quantity_remaining - $2 WHERE id = $1',
+            `UPDATE inventory_batches SET quantity_remaining = quantity_remaining - $2
+             WHERE id = $1 AND quantity_remaining - quantity_blocked >= $2`,
             [batch.id, quantity],
           )
           await client.query(
@@ -3505,7 +3970,7 @@ app.post(['/api/orders', '/api/customer/orders'], requireCustomer, async (reques
       eventId: pendingEvent.rows[0].id,
       orderId,
       orderNumber,
-      pharmacyId,
+      pharmacyId: quote.pharmacyId,
       recipientRole: 'pharmacy_owner',
       status: 'pending',
     })
@@ -3622,6 +4087,235 @@ app.get('/api/me/orders/:id/events', requireCustomer, async (request, response, 
   }
 })
 
+function customerReturnRequestInput(body) {
+  const input = body && typeof body === 'object' && !Array.isArray(body) ? body : {}
+  const reason = typeof input.reason === 'string' ? input.reason.trim() : ''
+  if (reason.length < 3 || reason.length > 1000) {
+    return { error: 'Provide a return reason between 3 and 1000 characters.' }
+  }
+  if (!Array.isArray(input.items) || input.items.length < 1 || input.items.length > 30) {
+    return { error: 'Select at least one order item to return.' }
+  }
+  const items = input.items.map((item) => ({
+    orderItemId: item?.orderItemId,
+    quantity: item?.quantity,
+  }))
+  if (items.some((item) =>
+    !Number.isSafeInteger(item.orderItemId) || item.orderItemId < 1 ||
+    !Number.isSafeInteger(item.quantity) || item.quantity < 1 || item.quantity > 50
+  )) {
+    return { error: 'Each selected item needs a valid positive return quantity.' }
+  }
+  if (new Set(items.map((item) => item.orderItemId)).size !== items.length) {
+    return { error: 'An order item can appear only once in a return request.' }
+  }
+  return { value: { reason, items } }
+}
+
+async function restoreCancelledOrderInventory(client, orderId, reason) {
+  const items = await client.query(
+    `SELECT i.id::int AS id, i.medicine_id::int AS "medicineId", i.quantity,
+       EXISTS (SELECT 1 FROM inventory_batches b WHERE b.medicine_id = i.medicine_id) AS "hasBatches"
+     FROM sales_order_items i
+     WHERE i.order_id = $1
+     ORDER BY i.medicine_id, i.id
+     FOR UPDATE OF i`,
+    [orderId],
+  )
+  if (!items.rowCount || items.rows.some((item) => item.medicineId === null)) {
+    throw new ApiError(409, 'The original order items cannot be matched to inventory for an exact cancellation.', 'ORDER_ALLOCATION_MISMATCH')
+  }
+
+  const medicineIds = [...new Set(items.rows.map((item) => item.medicineId))].sort((a, b) => a - b)
+  const medicines = await client.query(
+    `SELECT id::int AS id, stock FROM medicines
+     WHERE id = ANY($1::bigint[])
+     ORDER BY id
+     FOR UPDATE`,
+    [medicineIds],
+  )
+  if (medicines.rowCount !== medicineIds.length) {
+    throw new ApiError(409, 'The original medicines cannot be locked for cancellation.', 'ORDER_ALLOCATION_MISMATCH')
+  }
+
+  const allocations = await client.query(
+    `SELECT a.order_item_id::int AS "orderItemId", a.inventory_batch_id::int AS "batchId",
+       a.quantity, b.medicine_id::int AS "batchMedicineId"
+     FROM order_item_batch_allocations a
+     JOIN sales_order_items i ON i.id = a.order_item_id
+     JOIN inventory_batches b ON b.id = a.inventory_batch_id
+     WHERE i.order_id = $1
+     ORDER BY i.medicine_id, b.expiry_date ASC NULLS LAST, b.received_at, b.id
+     FOR UPDATE OF a, b`,
+    [orderId],
+  )
+  const quantityByItem = new Map()
+  for (const allocation of allocations.rows) {
+    if (allocation.batchMedicineId !== items.rows.find((item) => item.id === allocation.orderItemId)?.medicineId) {
+      throw new ApiError(409, 'An order allocation points to a different medicine batch.', 'ORDER_ALLOCATION_MISMATCH')
+    }
+    quantityByItem.set(
+      allocation.orderItemId,
+      (quantityByItem.get(allocation.orderItemId) ?? 0) + allocation.quantity,
+    )
+  }
+  if (items.rows.some((item) =>
+    item.hasBatches
+      ? quantityByItem.get(item.id) !== item.quantity
+      : (quantityByItem.get(item.id) ?? 0) !== 0
+  )) {
+    throw new ApiError(409, 'The original batch allocations do not match the order quantities; no stock was restored.', 'ORDER_ALLOCATION_MISMATCH')
+  }
+
+  const quantityByMedicine = new Map()
+  for (const item of items.rows) {
+    quantityByMedicine.set(item.medicineId, (quantityByMedicine.get(item.medicineId) ?? 0) + item.quantity)
+  }
+  for (const allocation of allocations.rows) {
+    await client.query(
+      `UPDATE inventory_batches SET quantity_remaining = quantity_remaining + $2 WHERE id = $1`,
+      [allocation.batchId, allocation.quantity],
+    )
+    await client.query(
+      `INSERT INTO stock_movements (medicine_id, inventory_batch_id, movement_type, quantity_change, note)
+       VALUES ($1, $2, 'return', $3, $4)`,
+      [allocation.batchMedicineId, allocation.batchId, allocation.quantity, `Order ${orderId} cancelled: ${reason}`],
+    )
+  }
+  for (const item of items.rows.filter((entry) => !entry.hasBatches)) {
+    await client.query(
+      `INSERT INTO stock_movements (medicine_id, movement_type, quantity_change, note)
+       VALUES ($1, 'return', $2, $3)`,
+      [item.medicineId, item.quantity, `Order ${orderId} cancelled: ${reason}`],
+    )
+  }
+  for (const [medicineId, quantity] of quantityByMedicine) {
+    const updated = await client.query(
+      `UPDATE medicines SET stock = stock + $2, updated_at = now()
+       WHERE id = $1 AND stock <= 2147483647 - $2
+       RETURNING id`,
+      [medicineId, quantity],
+    )
+    if (!updated.rowCount) {
+      throw new ApiError(409, 'Restoring this cancellation would exceed the supported inventory quantity.', 'INVENTORY_LIMIT')
+    }
+  }
+}
+
+app.post('/api/me/orders/:id/cancel', requireCustomer, async (request, response, next) => {
+  const id = Number(request.params.id)
+  const reason = typeof request.body?.reason === 'string' ? request.body.reason.trim() : ''
+  if (!Number.isSafeInteger(id) || id < 1) return response.status(400).json({ error: 'Invalid order ID.' })
+  if (reason.length < 3 || reason.length > 1000) {
+    return response.status(400).json({ error: 'Provide a cancellation reason between 3 and 1000 characters.' })
+  }
+
+  let client
+  try {
+    client = await pool.connect()
+    await client.query('BEGIN')
+    const order = await client.query(
+      `SELECT o.id, o.status, o.order_number AS "orderNumber", o.pharmacy_id AS "pharmacyId",
+         o.payment_status AS "paymentStatus", o.total::float8 AS total
+       FROM sales_orders o
+       JOIN customers c ON c.id = o.customer_id
+       WHERE o.id = $1 AND c.user_account_id = $2
+       FOR UPDATE OF o`,
+      [id, request.user.id],
+    )
+    if (!order.rowCount) {
+      await client.query('ROLLBACK')
+      return response.status(404).json({ error: 'Order was not found.' })
+    }
+    const current = order.rows[0]
+    if (current.status === 'cancelled') {
+      const previous = await client.query(
+        `SELECT reason FROM customer_returns
+         WHERE order_id = $1 AND request_type = 'cancellation'`,
+        [id],
+      )
+      if (previous.rows[0]?.reason !== reason) {
+        await client.query('ROLLBACK')
+        return response.status(409).json({ error: 'This order has already been cancelled.' })
+      }
+      const replay = await client.query(`${orderSelect} WHERE o.id = $1 AND c.user_account_id = $2`, [id, request.user.id])
+      await client.query('COMMIT')
+      return response.json({ ...replay.rows[0], idempotentReplay: true })
+    }
+    if (current.status !== 'pending') {
+      await client.query('ROLLBACK')
+      return response.status(409).json({
+        error: 'Orders can only be cancelled before the pharmacy accepts them.',
+        code: 'ORDER_NOT_CANCELLABLE',
+        currentStatus: current.status,
+      })
+    }
+
+    await restoreCancelledOrderInventory(client, id, reason)
+    const updated = await client.query(
+      `UPDATE sales_orders
+       SET status = 'cancelled', delivery_otp_hash = NULL,
+           delivery_code_verifier = NULL, delivery_code_key_version = NULL,
+           delivery_failed_attempts = 0, delivery_locked_until = NULL, updated_at = now()
+       WHERE id = $1 AND status = 'pending'
+       RETURNING id`,
+      [id],
+    )
+    if (!updated.rowCount) throw new ApiError(409, 'The order changed and can no longer be cancelled.', 'ORDER_NOT_CANCELLABLE')
+
+    const refundStatus = current.paymentStatus === 'paid' && current.total > 0
+      ? 'pending_reconciliation'
+      : 'not_required'
+    await client.query(
+      `INSERT INTO customer_returns
+        (order_id, customer_user_account_id, pharmacy_id, request_type, status, reason,
+         refund_amount, refund_status, decided_by_user_account_id, decided_at)
+       VALUES ($1, $2, $3, 'cancellation', 'approved', $4, $5, $6, $2, now())`,
+      [id, request.user.id, current.pharmacyId, reason,
+        refundStatus === 'pending_reconciliation' ? current.total : 0, refundStatus],
+    )
+    const event = await client.query(
+      `INSERT INTO order_status_events (order_id, status, actor_user_id, actor_role, actor_name, note)
+       VALUES ($1, 'cancelled', $2, 'customer', $3, $4)
+       RETURNING id`,
+      [id, request.user.id, request.user.fullName, reason],
+    )
+    await createOrderNotification(client, {
+      eventId: event.rows[0].id,
+      orderId: id,
+      orderNumber: current.orderNumber,
+      pharmacyId: current.pharmacyId,
+      recipientRole: 'pharmacy_owner',
+      status: 'cancelled',
+      note: reason,
+    })
+    await client.query(
+      `INSERT INTO audit_events (actor, action, entity_type, entity_id, details)
+       VALUES ($1, 'customer_order_cancelled', 'sales_order', $2, $3::jsonb)`,
+      [request.user.email, id, JSON.stringify({
+        fromStatus: 'pending',
+        toStatus: 'cancelled',
+        reason,
+        refundStatus,
+      })],
+    )
+    const result = await client.query(
+      `${orderSelect} WHERE o.id = $1 AND c.user_account_id = $2`,
+      [id, request.user.id],
+    )
+    await client.query('COMMIT')
+    response.json(result.rows[0])
+  } catch (error) {
+    if (client) await rollbackTransaction(client)
+    if (error?.code === '23505') {
+      return response.status(409).json({ error: 'This cancellation has already been recorded.' })
+    }
+    next(error)
+  } finally {
+    client?.release()
+  }
+})
+
 app.get('/api/customer/orders', requireCustomer, async (request, response, next) => {
   try {
     const result = await pool.query(
@@ -3643,6 +4337,639 @@ app.get('/api/owner/orders', requireOwner, async (request, response, next) => {
       [request.user.pharmacyId],
     )
     response.json(result.rows)
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.post('/api/me/returns', requireCustomer, async (request, response, next) => {
+  const parsed = customerReturnRequestInput(request.body)
+  if (parsed.error) return response.status(400).json({ error: parsed.error })
+  const orderId = request.body?.orderId
+  if (!Number.isSafeInteger(orderId) || orderId < 1) {
+    return response.status(400).json({ error: 'A valid order ID is required.' })
+  }
+
+  let client
+  try {
+    client = await pool.connect()
+    await client.query('BEGIN')
+    const order = await client.query(
+      `SELECT o.id, o.status, o.pharmacy_id AS "pharmacyId", c.user_account_id AS "customerUserId",
+         (SELECT MAX(e.created_at) FROM order_status_events e
+          WHERE e.order_id = o.id AND e.status = 'delivered') AS "deliveredAt"
+       FROM sales_orders o
+       JOIN customers c ON c.id = o.customer_id
+       WHERE o.id = $1 AND c.user_account_id = $2
+       FOR UPDATE OF o`,
+      [orderId, request.user.id],
+    )
+    if (!order.rowCount) {
+      await client.query('ROLLBACK')
+      return response.status(404).json({ error: 'Order was not found.' })
+    }
+    if (order.rows[0].status !== 'delivered' || !order.rows[0].deliveredAt) {
+      await client.query('ROLLBACK')
+      return response.status(409).json({ error: 'Return requests are available only for delivered orders.' })
+    }
+    const deliveredMs = new Date(order.rows[0].deliveredAt).getTime()
+    if (!Number.isFinite(deliveredMs) || deliveredMs < Date.now() - 24 * 60 * 60 * 1000) {
+      await client.query('ROLLBACK')
+      return response.status(409).json({ error: 'Return requests must be submitted within 24 hours after delivery.' })
+    }
+
+    const itemIds = parsed.value.items.map((item) => item.orderItemId)
+    const orderItems = await client.query(
+      `SELECT id::int AS id, quantity
+       FROM sales_order_items
+       WHERE order_id = $1 AND id = ANY($2::bigint[])
+       ORDER BY id
+       FOR UPDATE`,
+      [orderId, itemIds],
+    )
+    if (orderItems.rowCount !== parsed.value.items.length) {
+      await client.query('ROLLBACK')
+      return response.status(400).json({ error: 'Select items from this order only.' })
+    }
+    const quantityById = new Map(orderItems.rows.map((item) => [item.id, item.quantity]))
+    if (parsed.value.items.some((item) => item.quantity > quantityById.get(item.orderItemId))) {
+      await client.query('ROLLBACK')
+      return response.status(400).json({ error: 'Return quantities cannot exceed the quantities purchased.' })
+    }
+
+    const existing = await client.query(
+      `SELECT id, status FROM customer_returns
+       WHERE order_id = $1 AND request_type = 'return'
+         AND status IN ('requested', 'approved')
+       LIMIT 1`,
+      [orderId],
+    )
+    if (existing.rowCount) {
+      await client.query('ROLLBACK')
+      return response.status(409).json({ error: 'An active return request already exists for this order.' })
+    }
+
+    const inserted = await client.query(
+      `INSERT INTO customer_returns
+        (order_id, customer_user_account_id, pharmacy_id, request_type, status, reason)
+       VALUES ($1, $2, $3, 'return', 'requested', $4)
+       RETURNING id::int AS id`,
+      [orderId, request.user.id, order.rows[0].pharmacyId, parsed.value.reason],
+    )
+    for (const item of parsed.value.items) {
+      await client.query(
+        `INSERT INTO customer_return_items (return_id, order_item_id, requested_quantity)
+         VALUES ($1, $2, $3)`,
+        [inserted.rows[0].id, item.orderItemId, item.quantity],
+      )
+    }
+
+    const owners = await client.query(
+      `SELECT id FROM user_accounts
+       WHERE role = 'pharmacy_owner' AND pharmacy_id = $1`,
+      [order.rows[0].pharmacyId],
+    )
+    for (const owner of owners.rows) {
+      await client.query(
+        `INSERT INTO notifications
+          (recipient_user_id, recipient_role, pharmacy_id, type, reference_type,
+           reference_id, title, message)
+         VALUES ($1, 'pharmacy_owner', $2, 'order_status', 'sales_order', $3,
+           'Customer return request', $4)`,
+        [owner.id, order.rows[0].pharmacyId, orderId,
+          `A return was requested for order ${orderId}: ${parsed.value.reason}`],
+      )
+    }
+    await client.query(
+      `INSERT INTO audit_events (actor, action, entity_type, entity_id, details)
+       VALUES ($1, 'customer_return_requested', 'customer_return', $2, $3::jsonb)`,
+      [request.user.email, inserted.rows[0].id, JSON.stringify({
+        orderId,
+        reason: parsed.value.reason,
+        items: parsed.value.items,
+      })],
+    )
+    const result = await client.query(
+      `${orderSelect} WHERE o.id = $1 AND c.user_account_id = $2`,
+      [orderId, request.user.id],
+    )
+    await client.query('COMMIT')
+    response.status(201).json(result.rows[0])
+  } catch (error) {
+    if (client) await rollbackTransaction(client)
+    if (error?.code === '23505') {
+      return response.status(409).json({ error: 'An active return request already exists for this order.' })
+    }
+    next(error)
+  } finally {
+    client?.release()
+  }
+})
+
+app.post('/api/owner/returns/:id/decision', requireOwner, async (request, response, next) => {
+  const returnId = Number(request.params.id)
+  const decision = request.body?.decision
+  const decisionReason = typeof request.body?.reason === 'string' ? request.body.reason.trim() : ''
+  if (!Number.isSafeInteger(returnId) || returnId < 1) return response.status(400).json({ error: 'Invalid return request ID.' })
+  if (!['approved', 'rejected'].includes(decision)) {
+    return response.status(400).json({ error: 'Choose approve or reject for this return request.' })
+  }
+  if (decisionReason.length < 3 || decisionReason.length > 1000) {
+    return response.status(400).json({ error: 'Provide a decision reason between 3 and 1000 characters.' })
+  }
+
+  const dispositionValues = ['quarantine', 'damaged', 'non_returnable', 'inspected']
+  const decisionItems = request.body?.items
+  if (decision === 'approved' && (!Array.isArray(decisionItems) || decisionItems.length < 1 || decisionItems.length > 30)) {
+    return response.status(400).json({ error: 'Record a disposition for each returned order item.' })
+  }
+  if (decision === 'approved' && decisionItems.some((item) =>
+    !Number.isSafeInteger(item?.returnItemId) || item.returnItemId < 1 ||
+    !Number.isSafeInteger(item?.receivedQuantity) || item.receivedQuantity < 0 ||
+    typeof item?.disposition !== 'string' || !dispositionValues.includes(item.disposition) ||
+    typeof item?.restockSellable !== 'boolean' ||
+    typeof item?.lawfulRestockConfirmed !== 'boolean' ||
+    (item.restockSellable && item.receivedQuantity < 1)
+  )) {
+    return response.status(400).json({ error: 'Return quantities, dispositions, and restock authorization must be valid.' })
+  }
+  if (decision === 'approved' && new Set(decisionItems.map((item) => item.returnItemId)).size !== decisionItems.length) {
+    return response.status(400).json({ error: 'A returned order item can be recorded only once.' })
+  }
+
+  let client
+  try {
+    client = await pool.connect()
+    await client.query('BEGIN')
+    const result = await client.query(
+      `SELECT r.id::int AS id, r.order_id::int AS "orderId", r.status,
+         r.request_type AS "requestType", r.reason, r.decision_reason AS "decisionReason",
+         o.order_number AS "orderNumber",
+         o.status AS "orderStatus", o.payment_status AS "paymentStatus", o.pharmacy_id AS "pharmacyId",
+         c.user_account_id::int AS "customerUserId"
+       FROM customer_returns r
+       JOIN sales_orders o ON o.id = r.order_id
+       JOIN customers c ON c.id = o.customer_id
+       WHERE r.id = $1 AND r.pharmacy_id = $2
+       FOR UPDATE OF r, o`,
+      [returnId, request.user.pharmacyId],
+    )
+    if (!result.rowCount) {
+      await client.query('ROLLBACK')
+      return response.status(404).json({ error: 'Return request was not found for this pharmacy.' })
+    }
+    const current = result.rows[0]
+    if (current.requestType !== 'return' || current.orderStatus !== 'delivered') {
+      await client.query('ROLLBACK')
+      return response.status(409).json({ error: 'Only delivered-order return requests can be reviewed here.' })
+    }
+    if (current.status !== 'requested') {
+      if (current.status === decision && current.decisionReason === decisionReason) {
+        const replay = await client.query(
+          `${orderSelect} WHERE o.id = $1 AND o.pharmacy_id = $2`,
+          [current.orderId, request.user.pharmacyId],
+        )
+        await client.query('COMMIT')
+        return response.json({ ...replay.rows[0], idempotentReplay: true })
+      }
+      await client.query('ROLLBACK')
+      return response.status(409).json({ error: 'This return request has already been decided.' })
+    }
+
+    const returnItems = await client.query(
+      `SELECT ri.id::int AS "returnItemId", ri.order_item_id::int AS "orderItemId",
+         ri.requested_quantity AS "requestedQuantity", i.quantity AS "orderedQuantity",
+         i.medicine_id::int AS "medicineId", i.medicine_name AS "medicineName",
+         i.prescription_required_at_order AS "prescriptionRequired"
+       FROM customer_return_items ri
+       JOIN sales_order_items i ON i.id = ri.order_item_id
+       WHERE ri.return_id = $1
+       ORDER BY ri.id
+       FOR UPDATE OF ri, i`,
+      [returnId],
+    )
+    if (!returnItems.rowCount) {
+      await client.query('ROLLBACK')
+      return response.status(409).json({ error: 'The return request has no items to review.' })
+    }
+
+    if (decision === 'approved') {
+      if (decisionItems.length !== returnItems.rowCount) {
+        await client.query('ROLLBACK')
+        return response.status(400).json({ error: 'Provide a disposition for every requested return item.' })
+      }
+      const inputById = new Map(decisionItems.map((item) => [item.returnItemId, item]))
+      if (returnItems.rows.some((item) => !inputById.has(item.returnItemId))) {
+        await client.query('ROLLBACK')
+        return response.status(400).json({ error: 'The decision includes a return item that does not belong to this request.' })
+      }
+      let totalReceived = 0
+      for (const item of returnItems.rows) {
+        const decisionItem = inputById.get(item.returnItemId)
+        if (decisionItem.receivedQuantity > item.requestedQuantity) {
+          await client.query('ROLLBACK')
+          return response.status(400).json({ error: `Received quantity cannot exceed the request for ${item.medicineName}.` })
+        }
+        if (decisionItem.restockSellable &&
+            (decisionItem.disposition !== 'inspected' || !decisionItem.lawfulRestockConfirmed || item.prescriptionRequired)) {
+          await client.query('ROLLBACK')
+          return response.status(400).json({ error: 'Sellable restock requires inspection, lawful-policy confirmation, and a non-prescription item.' })
+        }
+        totalReceived += decisionItem.receivedQuantity
+      }
+      if (totalReceived < 1) {
+        await client.query('ROLLBACK')
+        return response.status(400).json({ error: 'Record at least one physically received item before approving the return.' })
+      }
+
+      const medicineIds = [...new Set(returnItems.rows.filter((item) => item.medicineId !== null).map((item) => item.medicineId))].sort((a, b) => a - b)
+      const medicines = await client.query(
+        `SELECT id::int AS id, stock, is_active AS "isActive"
+         FROM medicines WHERE id = ANY($1::bigint[]) ORDER BY id FOR UPDATE`,
+        [medicineIds],
+      )
+      if (medicines.rowCount !== medicineIds.length) {
+        await client.query('ROLLBACK')
+        return response.status(409).json({ error: 'The original medicine inventory is unavailable for return tracking.' })
+      }
+      const medicineById = new Map(medicines.rows.map((medicine) => [medicine.id, medicine]))
+      const receivedByMedicine = new Map()
+      for (const item of returnItems.rows) {
+        const decisionItem = inputById.get(item.returnItemId)
+        if (decisionItem.receivedQuantity && item.medicineId === null) {
+          await client.query('ROLLBACK')
+          return response.status(409).json({ error: 'A returned product has no original medicine record for stock tracking.' })
+        }
+        if (decisionItem.restockSellable && !medicineById.get(item.medicineId)?.isActive) {
+          await client.query('ROLLBACK')
+          return response.status(409).json({ error: 'Archived medicines cannot be returned to sellable stock.' })
+        }
+        receivedByMedicine.set(
+          item.medicineId,
+          (receivedByMedicine.get(item.medicineId) ?? 0) + decisionItem.receivedQuantity,
+        )
+      }
+
+      const receivedItemIds = returnItems.rows
+        .filter((item) => inputById.get(item.returnItemId).receivedQuantity > 0)
+        .map((item) => item.orderItemId)
+      const allocations = receivedItemIds.length
+        ? await client.query(
+          `SELECT a.order_item_id::int AS "orderItemId", a.inventory_batch_id::int AS "batchId",
+             a.quantity, b.medicine_id::int AS "medicineId", b.expiry_date::text AS "expiryDate",
+             b.quantity_remaining AS "quantityRemaining", b.quantity_blocked AS "quantityBlocked",
+             (b.expiry_date IS NULL OR b.expiry_date >= ${inventoryTodayExpression}) AS "isCurrentlyValid"
+           FROM order_item_batch_allocations a
+           JOIN inventory_batches b ON b.id = a.inventory_batch_id
+           WHERE a.order_item_id = ANY($1::bigint[])
+           ORDER BY a.order_item_id, b.expiry_date ASC NULLS LAST, b.received_at, b.id
+           FOR UPDATE OF a, b`,
+          [receivedItemIds],
+        )
+        : { rows: [] }
+      const availableByOrderItem = new Map()
+      for (const allocation of allocations.rows) {
+        availableByOrderItem.set(
+          allocation.orderItemId,
+          (availableByOrderItem.get(allocation.orderItemId) ?? 0) + allocation.quantity,
+        )
+      }
+      const orderItemById = new Map(returnItems.rows.map((item) => [item.orderItemId, item]))
+      if (receivedItemIds.some((itemId) =>
+        availableByOrderItem.get(itemId) !== orderItemById.get(itemId)?.orderedQuantity
+      )) {
+        await client.query('ROLLBACK')
+        return response.status(409).json({ error: 'Original batch allocations are incomplete; no returned stock was changed.' })
+      }
+
+      const inventoryAuditSessionId = randomUUID()
+      for (const item of returnItems.rows) {
+        const decisionItem = inputById.get(item.returnItemId)
+        await client.query(
+          `UPDATE customer_return_items
+           SET received_quantity = $2, disposition = $3, restock_sellable = $4,
+               lawful_restock_confirmed = $5
+           WHERE id = $1`,
+          [item.returnItemId, decisionItem.receivedQuantity, decisionItem.disposition,
+            decisionItem.restockSellable, decisionItem.lawfulRestockConfirmed],
+        )
+        let remainingToAllocate = decisionItem.receivedQuantity
+        for (const allocation of allocations.rows.filter((entry) => entry.orderItemId === item.orderItemId)) {
+          if (remainingToAllocate === 0) break
+          const quantity = Math.min(remainingToAllocate, allocation.quantity)
+          if (decisionItem.restockSellable && !allocation.isCurrentlyValid) {
+            await client.query('ROLLBACK')
+            return response.status(400).json({ error: 'Expired batches cannot receive sellable returns.' })
+          }
+          const blockedIncrease = decisionItem.restockSellable ? 0 : quantity
+          const updatedBatch = await client.query(
+            `UPDATE inventory_batches
+             SET quantity_remaining = quantity_remaining + $2,
+                 quantity_blocked = quantity_blocked + $3
+             WHERE id = $1
+               AND quantity_remaining <= 2147483647 - $2
+               AND quantity_blocked <= 2147483647 - $3
+             RETURNING quantity_remaining AS "newQuantity",
+               CASE WHEN expiry_date IS NOT NULL AND expiry_date < ${inventoryTodayExpression}
+                 THEN 0 ELSE (quantity_remaining - quantity_blocked)::int
+               END AS "newSellableQuantity"`,
+            [allocation.batchId, quantity, blockedIncrease],
+          )
+          if (!updatedBatch.rowCount) throw new ApiError(409, 'Returned stock exceeds the supported batch quantity.', 'INVENTORY_LIMIT')
+          await client.query(
+            `INSERT INTO customer_return_item_batches
+              (return_item_id, inventory_batch_id, quantity, restocked_sellable)
+             VALUES ($1, $2, $3, $4)`,
+            [item.returnItemId, allocation.batchId, quantity, decisionItem.restockSellable],
+          )
+          await client.query(
+            `INSERT INTO stock_movements (medicine_id, inventory_batch_id, movement_type, quantity_change, note)
+             VALUES ($1, $2, 'return', $3, $4)`,
+            [item.medicineId, allocation.batchId, quantity,
+              `Return ${returnId}: ${decisionItem.disposition}; ${decisionItem.restockSellable ? 'inspected sellable restock' : 'held non-sellable'}; ${decisionReason}`],
+          )
+          const previousQuantity = allocation.quantityRemaining
+          const previousSellable = allocation.isCurrentlyValid
+            ? allocation.quantityRemaining - allocation.quantityBlocked
+            : 0
+          await client.query(
+            `INSERT INTO inventory_audits
+              (session_id, pharmacy_id, medicine_id, inventory_batch_id,
+               system_quantity, counted_quantity, quantity_change,
+               system_sellable_quantity, counted_sellable_quantity, sellable_quantity_change,
+               reason, authorizer_user_id, authorizer_name)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+            [inventoryAuditSessionId, current.pharmacyId, item.medicineId, allocation.batchId,
+              previousQuantity, previousQuantity + quantity, quantity,
+              previousSellable, Number(updatedBatch.rows[0].newSellableQuantity),
+              Number(updatedBatch.rows[0].newSellableQuantity) - previousSellable,
+              `Authorized customer return ${returnId}; ${decisionItem.disposition}; ${decisionReason}`,
+              request.user.id, request.user.fullName],
+          )
+          remainingToAllocate -= quantity
+        }
+        if (remainingToAllocate > 0) {
+          await client.query('ROLLBACK')
+          return response.status(409).json({ error: 'The received quantity could not be matched to the original batches.' })
+        }
+      }
+      for (const [medicineId, quantity] of receivedByMedicine) {
+        if (!medicineId || quantity === 0) continue
+        const updatedMedicine = await client.query(
+          `UPDATE medicines SET stock = stock + $2, updated_at = now()
+           WHERE id = $1 AND pharmacy_id = $3 AND stock <= 2147483647 - $2
+           RETURNING id`,
+          [medicineId, quantity, current.pharmacyId],
+        )
+        if (!updatedMedicine.rowCount) throw new ApiError(409, 'Returned stock exceeds the supported medicine quantity.', 'INVENTORY_LIMIT')
+      }
+    }
+
+    let refundAmount = 0
+    let refundStatus = 'not_required'
+    if (decision === 'approved' && current.paymentStatus === 'paid') {
+      const amount = await client.query(
+        `SELECT COALESCE(SUM(ROUND(i.line_total * ri.received_quantity::numeric / i.quantity, 2)), 0)::float8 AS amount
+         FROM customer_return_items ri
+         JOIN sales_order_items i ON i.id = ri.order_item_id
+         WHERE ri.return_id = $1`,
+        [returnId],
+      )
+      refundAmount = amount.rows[0].amount
+      if (refundAmount > 0) refundStatus = 'pending_reconciliation'
+    }
+    await client.query(
+      `UPDATE customer_returns
+       SET status = $2, decision_reason = $3, refund_amount = $4,
+           refund_status = $5, decided_by_user_account_id = $6,
+           decided_at = now(), updated_at = now()
+       WHERE id = $1`,
+      [returnId, decision, decisionReason, refundAmount, refundStatus, request.user.id],
+    )
+    await client.query(
+      `INSERT INTO notifications
+        (recipient_user_id, recipient_role, pharmacy_id, type, reference_type,
+         reference_id, title, message)
+       VALUES ($1, 'customer', $2, 'order_status', 'sales_order', $3, $4, $5)`,
+      [current.customerUserId, current.pharmacyId, current.orderId,
+        decision === 'approved' ? 'Return request approved' : 'Return request declined',
+        decision === 'approved'
+          ? `Return ${returnId} for order ${current.orderNumber} was approved. Refund status: ${refundStatus.replaceAll('_', ' ')}.`
+          : `Return ${returnId} for order ${current.orderNumber} was declined: ${decisionReason}`],
+    )
+    await client.query(
+      `INSERT INTO audit_events (actor, action, entity_type, entity_id, details)
+       VALUES ($1, $2, 'customer_return', $3, $4::jsonb)`,
+      [request.user.email, `customer_return_${decision}`, returnId, JSON.stringify({
+        orderId: current.orderId,
+        decision,
+        decisionReason,
+        refundAmount,
+        refundStatus,
+        items: decision === 'approved' ? decisionItems : [],
+      })],
+    )
+    const orderResult = await client.query(
+      `${orderSelect} WHERE o.id = $1 AND o.pharmacy_id = $2`,
+      [current.orderId, request.user.pharmacyId],
+    )
+    await client.query('COMMIT')
+    response.json(orderResult.rows[0])
+  } catch (error) {
+    if (client) await rollbackTransaction(client)
+    if (error?.code === '23505') {
+      return response.status(409).json({ error: 'The return decision has already been recorded.' })
+    }
+    next(error)
+  } finally {
+    client?.release()
+  }
+})
+
+async function getOwnerLowStock(pharmacyId) {
+  const result = await pool.query(
+    `SELECT m.id::int AS "medicineId", m.name, m.reorder_level AS "reorderLevel",
+       ${availableStockExpression}::int AS "sellableStock"
+     FROM medicines m
+     WHERE m.pharmacy_id = $1 AND m.is_active
+       AND (${availableStockExpression}) <= m.reorder_level
+     ORDER BY ${availableStockExpression}, m.name`,
+    [pharmacyId],
+  )
+  return {
+    lowStock: result.rows.filter((item) => item.sellableStock > 0),
+    outOfStock: result.rows.filter((item) => item.sellableStock === 0),
+  }
+}
+
+async function getOwnerExpiryData(pharmacyId) {
+  const [summary, batches] = await Promise.all([
+    pool.query(
+      `SELECT
+         COUNT(*) FILTER (WHERE expiry_date <= ${inventoryTodayExpression} + 7)::int AS "batches7Days",
+         COALESCE(SUM(sellable_quantity) FILTER (WHERE expiry_date <= ${inventoryTodayExpression} + 7), 0)::int AS "units7Days",
+         COALESCE(SUM(purchase_price * sellable_quantity) FILTER (WHERE expiry_date <= ${inventoryTodayExpression} + 7), 0)::float8 AS "purchaseCostAtRisk7Days",
+         COUNT(*) FILTER (WHERE expiry_date <= ${inventoryTodayExpression} + 30)::int AS "batches30Days",
+         COALESCE(SUM(sellable_quantity) FILTER (WHERE expiry_date <= ${inventoryTodayExpression} + 30), 0)::int AS "units30Days",
+         COALESCE(SUM(purchase_price * sellable_quantity) FILTER (WHERE expiry_date <= ${inventoryTodayExpression} + 30), 0)::float8 AS "purchaseCostAtRisk30Days",
+         COUNT(*) FILTER (WHERE expiry_date <= ${inventoryTodayExpression} + 90)::int AS "batches90Days",
+         COALESCE(SUM(sellable_quantity) FILTER (WHERE expiry_date <= ${inventoryTodayExpression} + 90), 0)::int AS "units90Days",
+         COALESCE(SUM(purchase_price * sellable_quantity) FILTER (WHERE expiry_date <= ${inventoryTodayExpression} + 90), 0)::float8 AS "purchaseCostAtRisk90Days"
+       FROM (
+         SELECT ib.expiry_date, ib.purchase_price,
+           (ib.quantity_remaining - ib.quantity_blocked)::bigint AS sellable_quantity
+         FROM inventory_batches ib
+         JOIN medicines m ON m.id = ib.medicine_id
+         WHERE m.pharmacy_id = $1 AND m.is_active
+           AND ib.quantity_remaining > ib.quantity_blocked
+           AND ib.expiry_date >= ${inventoryTodayExpression}
+           AND ib.expiry_date <= ${inventoryTodayExpression} + 90
+       ) expiring`,
+      [pharmacyId],
+    ),
+    pool.query(
+      `SELECT m.id::int AS "medicineId", m.name AS "medicineName",
+         ib.id::int AS "batchId", ib.batch_number AS "batchNumber",
+         to_char(ib.expiry_date, 'YYYY-MM-DD') AS "expiryDate",
+         (ib.expiry_date - ${inventoryTodayExpression})::int AS "daysUntilExpiry",
+         (ib.quantity_remaining - ib.quantity_blocked)::int AS "sellableQuantity",
+         ib.purchase_price::float8 AS "purchasePrice",
+         ((ib.quantity_remaining - ib.quantity_blocked)::numeric * ib.purchase_price)::float8 AS "purchaseCostAtRisk"
+       FROM inventory_batches ib
+       JOIN medicines m ON m.id = ib.medicine_id
+       WHERE m.pharmacy_id = $1 AND m.is_active
+         AND ib.quantity_remaining > ib.quantity_blocked
+         AND ib.expiry_date >= ${inventoryTodayExpression}
+         AND ib.expiry_date <= ${inventoryTodayExpression} + 90
+       ORDER BY ib.expiry_date, m.name, ib.id`,
+      [pharmacyId],
+    ),
+  ])
+  return { summary: summary.rows[0], batches: batches.rows }
+}
+
+app.get('/api/owner/low-stock', requireOwner, async (request, response, next) => {
+  try {
+    response.json(await getOwnerLowStock(request.user.pharmacyId))
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.get('/api/owner/expiry', requireOwner, async (request, response, next) => {
+  try {
+    response.json(await getOwnerExpiryData(request.user.pharmacyId))
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.get('/api/owner/dashboard', requireOwner, async (request, response, next) => {
+  const range = request.query.range || 'week'
+  if (!['today', 'week', 'month'].includes(range)) {
+    return response.status(400).json({ error: 'Choose a valid dashboard range.' })
+  }
+  const days = range === 'today' ? 1 : range === 'week' ? 7 : 30
+
+  try {
+    const [summary, expiry, sales, movements, orderEvents] = await Promise.all([
+      pool.query(
+        `WITH medicine_stock AS (
+           SELECT m.id, m.reorder_level, ${availableStockExpression}::int AS sellable_stock
+           FROM medicines m
+           WHERE m.pharmacy_id = $1 AND m.is_active
+         )
+         SELECT COUNT(*)::int AS "activeMedicines",
+           COALESCE(SUM(sellable_stock), 0)::int AS "sellableUnits",
+           COUNT(*) FILTER (WHERE sellable_stock > 0 AND sellable_stock <= reorder_level)::int AS "lowStock",
+           COUNT(*) FILTER (WHERE sellable_stock = 0)::int AS "outOfStock",
+           (SELECT COUNT(*)::int FROM sales_orders
+             WHERE pharmacy_id = $1 AND status = 'pending') AS "pendingOrders"
+         FROM medicine_stock`,
+        [request.user.pharmacyId],
+      ),
+      getOwnerExpiryData(request.user.pharmacyId),
+      pool.query(
+        `WITH bounds AS (
+           SELECT CASE WHEN $2 = 'today' THEN date_trunc('day', now())
+             ELSE date_trunc('day', now()) - (($3::int - 1) * INTERVAL '1 day') END AS starts_at,
+             CASE WHEN $2 = 'today' THEN date_trunc('hour', now())
+             ELSE date_trunc('day', now()) END AS ends_at,
+             CASE WHEN $2 = 'today' THEN INTERVAL '1 hour'
+             ELSE INTERVAL '1 day' END AS step
+         ), buckets AS (
+           SELECT generate_series(starts_at, ends_at, step) AS bucket
+           FROM bounds
+         ), gross AS (
+           SELECT date_trunc(CASE WHEN $2 = 'today' THEN 'hour' ELSE 'day' END, o.created_at) AS bucket,
+             SUM(o.total)::float8 AS amount
+           FROM sales_orders o, bounds b
+           WHERE o.pharmacy_id = $1 AND o.created_at >= b.starts_at AND o.created_at < now()
+             AND o.status NOT IN ('cancelled', 'declined')
+           GROUP BY 1
+         ), collected AS (
+           SELECT date_trunc(CASE WHEN $2 = 'today' THEN 'hour' ELSE 'day' END, p.created_at) AS bucket,
+             SUM(p.amount)::float8 AS amount
+           FROM payments p
+           JOIN sales_orders o ON o.id = p.order_id
+           CROSS JOIN bounds b
+           WHERE o.pharmacy_id = $1 AND p.status = 'paid'
+             AND p.created_at >= b.starts_at AND p.created_at < now()
+           GROUP BY 1
+         )
+         SELECT b.bucket,
+           CASE WHEN $2 = 'today' THEN to_char(b.bucket, 'HH24:00')
+             ELSE to_char(b.bucket, 'Mon DD') END AS label,
+           COALESCE(g.amount, 0)::float8 AS "grossSales",
+           COALESCE(c.amount, 0)::float8 AS "collectedPayments"
+         FROM buckets b
+         LEFT JOIN gross g USING (bucket)
+         LEFT JOIN collected c USING (bucket)
+         ORDER BY b.bucket`,
+        [request.user.pharmacyId, range, days],
+      ),
+      pool.query(
+        `SELECT sm.id::int AS id, sm.movement_type AS type, sm.quantity_change AS "quantityChange",
+           sm.note, sm.created_at AS "createdAt", m.id::int AS "medicineId",
+           m.name AS "medicineName", m.sku
+         FROM stock_movements sm
+         JOIN medicines m ON m.id = sm.medicine_id
+         WHERE m.pharmacy_id = $1
+         ORDER BY sm.created_at DESC, sm.id DESC
+         LIMIT 8`,
+        [request.user.pharmacyId],
+      ),
+      pool.query(
+        `SELECT e.id::int AS id, o.id::int AS "orderId", o.order_number AS "orderNumber",
+           e.status, e.actor_name AS "actorName", e.created_at AS "createdAt", e.note
+         FROM order_status_events e
+         JOIN sales_orders o ON o.id = e.order_id
+         WHERE o.pharmacy_id = $1
+         ORDER BY e.created_at DESC, e.id DESC
+         LIMIT 8`,
+        [request.user.pharmacyId],
+      ),
+    ])
+
+    response.json({
+      range,
+      kpis: { ...summary.rows[0], ...expiry.summary },
+      sales: sales.rows,
+      recentStockMovements: movements.rows,
+      recentOrderEvents: orderEvents.rows,
+    })
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.get('/api/owner/alerts', requireOwner, async (request, response, next) => {
+  try {
+    const [stock, expiry] = await Promise.all([
+      getOwnerLowStock(request.user.pharmacyId),
+      getOwnerExpiryData(request.user.pharmacyId),
+    ])
+    response.json({ ...stock, expiringBatches: expiry.batches, expiryRisk: expiry.summary })
   } catch (error) {
     next(error)
   }
@@ -3729,7 +5056,7 @@ app.get('/api/me/reminders', requireCustomer, async (request, response, next) =>
       pool.query(
         `SELECT r.id::int AS id, r.medicine_id::int AS "medicineId", m.name AS "medicineName",
            r.pharmacy_id::int AS "pharmacyId", p.name AS "pharmacyName", r.opt_in AS "optIn",
-           r.next_reminder_date AS "nextReminderDate", r.interval_days AS "intervalDays",
+           r.next_reminder_date::text AS "nextReminderDate", r.interval_days AS "intervalDays",
            r.last_sent_at AS "lastSentAt", r.cancelled_at AS "cancelledAt"
          FROM medicine_reminders r
          JOIN medicines m ON m.id = r.medicine_id
@@ -3788,7 +5115,7 @@ app.post('/api/me/reminders', requireCustomer, async (request, response, next) =
     client = await pool.connect()
     await client.query('BEGIN')
     const medicine = await client.query(
-      `SELECT m.id, m.pharmacy_id AS "pharmacyId"
+      `SELECT m.id::int AS id, m.pharmacy_id::int AS "pharmacyId"
        FROM medicines m JOIN pharmacies p ON p.id = m.pharmacy_id
        WHERE m.id = $1 AND m.is_active AND p.approval_status = 'approved'
        FOR SHARE`,
@@ -3812,7 +5139,7 @@ app.post('/api/me/reminders', requireCustomer, async (request, response, next) =
          updated_at = now()
        RETURNING id::int AS id, medicine_id::int AS "medicineId",
          pharmacy_id::int AS "pharmacyId", opt_in AS "optIn",
-         next_reminder_date AS "nextReminderDate", interval_days AS "intervalDays"`,
+         next_reminder_date::text AS "nextReminderDate", interval_days AS "intervalDays"`,
       [request.user.id, medicineId, pharmacyId ?? medicine.rows[0].pharmacyId, nextReminderDate, intervalDays],
     )
     await client.query('COMMIT')
@@ -3853,7 +5180,7 @@ app.patch('/api/me/reminders/:id', requireCustomer, async (request, response, ne
        WHERE r.id = $1
          AND r.customer_account_id = $2
        RETURNING r.id::int AS id, r.opt_in AS "optIn",
-         r.next_reminder_date AS "nextReminderDate", r.interval_days AS "intervalDays",
+         r.next_reminder_date::text AS "nextReminderDate", r.interval_days AS "intervalDays",
          r.cancelled_at AS "cancelledAt"`,
       [id, request.user.id, optIn, nextReminderDate ?? null, intervalDays ?? null],
     )
@@ -4215,7 +5542,7 @@ async function declineOwnerOrder(request, response, next) {
   const id = Number(request.params.id)
   const reason = typeof request.body?.reason === 'string' ? request.body.reason.trim() : ''
   if (!Number.isSafeInteger(id) || id < 1) return response.status(400).json({ error: 'Invalid order ID.' })
-  if (!reason) return response.status(400).json({ error: 'A decline reason is required.' })
+  if (reason.length < 3) return response.status(400).json({ error: 'Provide a decline reason with at least 3 characters.' })
   if (reason.length > 500) return response.status(400).json({ error: 'The decline reason must be 500 characters or fewer.' })
 
   let client
@@ -4223,10 +5550,13 @@ async function declineOwnerOrder(request, response, next) {
     client = await pool.connect()
     await client.query('BEGIN')
     const order = await client.query(
-      `SELECT id, status, order_number AS "orderNumber"
-       FROM sales_orders
-       WHERE id = $1 AND pharmacy_id = $2
-       FOR UPDATE`,
+      `SELECT o.id, o.status, o.order_number AS "orderNumber",
+         o.payment_status AS "paymentStatus", o.total::float8 AS total,
+         c.user_account_id::int AS "customerUserId"
+       FROM sales_orders o
+       JOIN customers c ON c.id = o.customer_id
+       WHERE o.id = $1 AND o.pharmacy_id = $2
+       FOR UPDATE OF o`,
       [id, request.user.pharmacyId],
     )
     if (!order.rowCount) {
@@ -4379,6 +5709,21 @@ async function declineOwnerOrder(request, response, next) {
       await client.query('ROLLBACK')
       return response.status(409).json({ error: 'The order is no longer pending.', code: 'ORDER_NOT_PENDING' })
     }
+    let refundStatus = 'not_required'
+    if (order.rows[0].paymentStatus === 'paid' && order.rows[0].total > 0) {
+      if (!order.rows[0].customerUserId) {
+        throw new ApiError(409, 'The paid order has no customer account for refund reconciliation.', 'REFUND_CUSTOMER_MISSING')
+      }
+      refundStatus = 'pending_reconciliation'
+      await client.query(
+        `INSERT INTO customer_returns
+          (order_id, customer_user_account_id, pharmacy_id, request_type, status, reason,
+           refund_amount, refund_status, decision_reason, decided_by_user_account_id, decided_at)
+         VALUES ($1, $2, $3, 'cancellation', 'approved', $4, $5, $6, $7, $8, now())`,
+        [id, order.rows[0].customerUserId, request.user.pharmacyId, reason, order.rows[0].total,
+          refundStatus, 'Order declined by pharmacy.', request.user.id],
+      )
+    }
     const declinedEvent = await client.query(
       `INSERT INTO order_status_events
         (order_id, status, actor_user_id, actor_role, actor_name, note)
@@ -4408,6 +5753,7 @@ async function declineOwnerOrder(request, response, next) {
           actorRole: 'pharmacy_owner',
           actorName: request.user.fullName,
           reason,
+          refundStatus,
         }),
       ],
     )

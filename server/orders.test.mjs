@@ -16,7 +16,7 @@ const adminPool = new pg.Pool({
   host: process.env.PGHOST || '/tmp',
   port: Number(process.env.PGPORT || 5432),
   database: 'postgres',
-  user: process.env.PGUSER || process.env.USER,
+  user: process.env.PGUSER || process.env.USER || process.env.USERNAME,
   password: process.env.PGPASSWORD || undefined,
   connectionTimeoutMillis: 3000,
 })
@@ -58,7 +58,7 @@ async function createSession(role, suffix) {
       email: `${role}-${suffix}@example.test`,
       password: 'order-test-password-2026',
       fullName: `Order Test ${suffix}`,
-      phone: `91${String(process.pid).slice(-5)}${suffix === 'owner' ? '1' : suffix === 'customer' ? '2' : '3'}`,
+      phone: `91${String(process.pid).slice(-5)}${suffix === 'owner' ? '1' : suffix === 'customer' ? '2' : suffix === 'second' ? '3' : '4'}`,
       ...(role === 'pharmacy_owner' ? { pharmacyName: `Order Test Pharmacy ${suffix}` } : {
         address: '10 Test Street',
         city: 'Test City',
@@ -79,7 +79,7 @@ async function createMedicine({
   prescriptionRequired = false,
   batchNumber = `B-${name.replaceAll(' ', '-')}`,
 }) {
-  const { response, body } = await apiRequest('/api/medicines', {
+  const { response, body } = await apiRequest('/api/owner/medicines', {
     token: ownerSession.token,
     method: 'POST',
     body: {
@@ -95,6 +95,7 @@ async function createMedicine({
       packUnit: 'tablets',
       price,
       stock,
+      pharmacyId: 999999,
       expiry,
       batchNumber,
       prescriptionRequired,
@@ -110,6 +111,31 @@ function orderBody(medicine, quantity = 1, unitPrice = medicine.price) {
     items: [{ medicineId: medicine.id, quantity, unitPrice }],
     paymentMethod: 'Cash on Delivery',
   }
+}
+
+async function deliverOrder(orderId) {
+  for (const [status, expectedStatus] of [
+    ['accepted', 'pending'],
+    ['preparing', 'accepted'],
+    ['ready', 'preparing'],
+    ['out_for_delivery', 'ready'],
+  ]) {
+    const transition = await apiRequest(`/api/owner/orders/${orderId}/transition`, {
+      token: ownerSession.token,
+      method: 'POST',
+      body: { status, expectedStatus },
+    })
+    assert.equal(transition.response.status, 200, transition.body?.error)
+  }
+  const code = await apiRequest(`/api/me/orders/${orderId}/delivery-code`, { token: customerSession.token })
+  assert.equal(code.response.status, 200, code.body?.error)
+  const delivered = await apiRequest(`/api/owner/orders/${orderId}/verify-delivery`, {
+    token: ownerSession.token,
+    method: 'POST',
+    body: { code: code.body.code },
+  })
+  assert.equal(delivered.response.status, 200, delivered.body?.error)
+  return delivered.body
 }
 
 async function waitForApi() {
@@ -157,7 +183,7 @@ before(async () => {
     host: process.env.PGHOST || '/tmp',
     port: Number(process.env.PGPORT || 5432),
     database: databaseName,
-    user: process.env.PGUSER || process.env.USER,
+    user: process.env.PGUSER || process.env.USER || process.env.USERNAME,
     password: process.env.PGPASSWORD || undefined,
   })
   await testPool.query(schema)
@@ -406,6 +432,81 @@ test('order creation rejects changed prices, expired batches and Rx-only product
   }
 })
 
+test('customers can cancel pending orders once and cannot cancel after pharmacy acceptance', async () => {
+  const medicine = await createMedicine({ name: 'Customer Cancellation', stock: 4 })
+  const placed = await apiRequest('/api/orders', {
+    token: customerSession.token,
+    method: 'POST',
+    body: orderBody(medicine, 2),
+    idempotencyKey: randomUUID(),
+  })
+  assert.equal(placed.response.status, 201, placed.body?.error)
+
+  const hidden = await apiRequest(`/api/me/orders/${placed.body.id}/cancel`, {
+    token: secondCustomerSession.token,
+    method: 'POST',
+    body: { reason: 'Changed my mind' },
+  })
+  assert.equal(hidden.response.status, 404)
+
+  const missingReason = await apiRequest(`/api/me/orders/${placed.body.id}/cancel`, {
+    token: customerSession.token,
+    method: 'POST',
+    body: { reason: ' ' },
+  })
+  assert.equal(missingReason.response.status, 400)
+
+  const reason = 'I no longer need this order.'
+  const cancelled = await apiRequest(`/api/me/orders/${placed.body.id}/cancel`, {
+    token: customerSession.token,
+    method: 'POST',
+    body: { reason },
+  })
+  assert.equal(cancelled.response.status, 200, cancelled.body?.error)
+  assert.equal(cancelled.body.status, 'cancelled')
+  assert.equal(cancelled.body.returnRequests[0].type, 'cancellation')
+  assert.equal(cancelled.body.returnRequests[0].refundStatus, 'not_required')
+
+  const replay = await apiRequest(`/api/me/orders/${placed.body.id}/cancel`, {
+    token: customerSession.token,
+    method: 'POST',
+    body: { reason },
+  })
+  assert.equal(replay.response.status, 200, replay.body?.error)
+  assert.equal(replay.body.idempotentReplay, true)
+  const restored = await testPool.query(
+    `SELECT m.stock, b.quantity_remaining AS "batchQuantity",
+       (SELECT COUNT(*)::int FROM stock_movements sm
+        WHERE sm.medicine_id = m.id AND sm.movement_type = 'return') AS "returnMovements"
+     FROM medicines m JOIN inventory_batches b ON b.medicine_id = m.id
+     WHERE m.id = $1`,
+    [medicine.id],
+  )
+  assert.deepEqual(restored.rows[0], { stock: 4, batchQuantity: 4, returnMovements: 1 })
+
+  const acceptedMedicine = await createMedicine({ name: 'Accepted Cancellation', stock: 2 })
+  const acceptedOrder = await apiRequest('/api/orders', {
+    token: customerSession.token,
+    method: 'POST',
+    body: orderBody(acceptedMedicine),
+    idempotencyKey: randomUUID(),
+  })
+  assert.equal(acceptedOrder.response.status, 201, acceptedOrder.body?.error)
+  const accepted = await apiRequest(`/api/owner/orders/${acceptedOrder.body.id}/transition`, {
+    token: ownerSession.token,
+    method: 'POST',
+    body: { status: 'accepted', expectedStatus: 'pending' },
+  })
+  assert.equal(accepted.response.status, 200, accepted.body?.error)
+  const tooLate = await apiRequest(`/api/me/orders/${acceptedOrder.body.id}/cancel`, {
+    token: customerSession.token,
+    method: 'POST',
+    body: { reason: 'Please cancel this order.' },
+  })
+  assert.equal(tooLate.response.status, 409)
+  assert.equal(tooLate.body.code, 'ORDER_NOT_CANCELLABLE')
+})
+
 test('owner transitions enforce gates and record authorized timeline and audit events', async () => {
   const medicine = await createMedicine({ name: 'Transition Strip', stock: 3 })
   const placed = await apiRequest('/api/orders', {
@@ -546,6 +647,207 @@ test('owner transitions enforce gates and record authorized timeline and audit e
   assert.equal(audit.rows[0].details.toStatus, 'accepted')
 })
 
+test('delivered orders allow partial returns with isolated review, blocked stock, and pending refund reconciliation', async () => {
+  const medicine = await createMedicine({ name: 'Return Review Strip', stock: 5, price: 12 })
+  const placed = await apiRequest('/api/orders', {
+    token: customerSession.token,
+    method: 'POST',
+    body: orderBody(medicine, 2),
+    idempotencyKey: randomUUID(),
+  })
+  assert.equal(placed.response.status, 201, placed.body?.error)
+  await testPool.query(`UPDATE sales_orders SET payment_status = 'paid' WHERE id = $1`, [placed.body.id])
+  await testPool.query(`UPDATE payments SET status = 'paid' WHERE order_id = $1`, [placed.body.id])
+  const delivered = await deliverOrder(placed.body.id)
+  const orderItemId = delivered.items[0].orderItemId
+
+  await testPool.query(
+    `UPDATE order_status_events SET created_at = now() - interval '25 hours'
+     WHERE order_id = $1 AND status = 'delivered'`,
+    [placed.body.id],
+  )
+  const expiredWindowRequest = await apiRequest('/api/me/returns', {
+    token: customerSession.token,
+    method: 'POST',
+    body: { orderId: placed.body.id, reason: 'Item not wanted', items: [{ orderItemId, quantity: 1 }] },
+  })
+  assert.equal(expiredWindowRequest.response.status, 409)
+  await testPool.query(
+    `UPDATE order_status_events SET created_at = now()
+     WHERE order_id = $1 AND status = 'delivered'`,
+    [placed.body.id],
+  )
+  const tooManyItems = await apiRequest('/api/me/returns', {
+    token: customerSession.token,
+    method: 'POST',
+    body: { orderId: placed.body.id, reason: 'Too many items', items: [{ orderItemId, quantity: 3 }] },
+  })
+  assert.equal(tooManyItems.response.status, 400)
+  const notOwnerCustomer = await apiRequest('/api/me/returns', {
+    token: secondCustomerSession.token,
+    method: 'POST',
+    body: { orderId: placed.body.id, reason: 'Wrong account', items: [{ orderItemId, quantity: 1 }] },
+  })
+  assert.equal(notOwnerCustomer.response.status, 404)
+  const notDelivered = await apiRequest('/api/me/returns', {
+    token: customerSession.token,
+    method: 'POST',
+    body: { orderId: placed.body.id, reason: 'Item not wanted', items: [{ orderItemId, quantity: 1 }] },
+  })
+  assert.equal(notDelivered.response.status, 201, notDelivered.body?.error)
+
+  const returnRequestId = notDelivered.body.returnRequests[0].id
+  const returnItemId = notDelivered.body.returnRequests[0].items[0].id
+  const secondOwner = await createSession('pharmacy_owner', 'second-owner')
+  const isolated = await apiRequest(`/api/owner/returns/${returnRequestId}/decision`, {
+    token: secondOwner.token,
+    method: 'POST',
+    body: { decision: 'rejected', reason: 'Other pharmacy' },
+  })
+  assert.equal(isolated.response.status, 404)
+
+  const invalidQuantity = await apiRequest('/api/me/returns', {
+    token: secondCustomerSession.token,
+    method: 'POST',
+    body: { orderId: placed.body.id, reason: 'Wrong account', items: [{ orderItemId, quantity: 1 }] },
+  })
+  assert.equal(invalidQuantity.response.status, 404)
+
+  const invalidRestock = await apiRequest(`/api/owner/returns/${returnRequestId}/decision`, {
+    token: ownerSession.token,
+    method: 'POST',
+    body: {
+      decision: 'approved',
+      reason: 'Inspection completed',
+      items: [{
+        returnItemId: returnItemId,
+        receivedQuantity: 1,
+        disposition: 'inspected',
+        restockSellable: true,
+        lawfulRestockConfirmed: false,
+      }],
+    },
+  })
+  assert.equal(invalidRestock.response.status, 400)
+
+  const approved = await apiRequest(`/api/owner/returns/${returnRequestId}/decision`, {
+    token: ownerSession.token,
+    method: 'POST',
+    body: {
+      decision: 'approved',
+      reason: 'Received and held for inspection',
+      items: [{
+        returnItemId,
+        receivedQuantity: 1,
+        disposition: 'quarantine',
+        restockSellable: false,
+        lawfulRestockConfirmed: false,
+      }],
+    },
+  })
+  assert.equal(approved.response.status, 200, approved.body?.error)
+  assert.equal(approved.body.returnRequests[0].items[0].receivedQuantity, 1)
+  assert.equal(approved.body.returnRequests[0].items[0].restockSellable, false)
+  assert.equal(approved.body.returnRequests[0].refundStatus, 'pending_reconciliation')
+  assert.equal(approved.body.paymentStatus, 'paid')
+
+  const inventory = await testPool.query(
+    `SELECT m.stock, b.quantity_remaining AS "batchQuantity",
+       b.quantity_blocked AS "blockedQuantity",
+       (b.quantity_remaining - b.quantity_blocked)::int AS "sellableQuantity"
+     FROM medicines m JOIN inventory_batches b ON b.medicine_id = m.id
+     WHERE m.id = $1`,
+    [medicine.id],
+  )
+  assert.deepEqual(inventory.rows[0], {
+    stock: 4,
+    batchQuantity: 4,
+    blockedQuantity: 1,
+    sellableQuantity: 3,
+  })
+  const reconciliation = await testPool.query(
+    `SELECT refund_amount::float8 AS amount, refund_status AS status
+     FROM customer_returns WHERE id = $1`,
+    [returnRequestId],
+  )
+  assert.equal(reconciliation.rows[0].status, 'pending_reconciliation')
+  assert.equal(reconciliation.rows[0].amount, Math.round(placed.body.items[0].lineTotal / 2 * 100) / 100)
+  const audits = await testPool.query(
+    `SELECT system_quantity AS "systemQuantity", counted_quantity AS "countedQuantity",
+       system_sellable_quantity AS "systemSellable", counted_sellable_quantity AS "countedSellable",
+       authorizer_user_id::int AS "authorizerId"
+     FROM inventory_audits WHERE reason LIKE $1`,
+    [`Authorized customer return ${returnRequestId};%`],
+  )
+  assert.deepEqual(audits.rows, [{
+    systemQuantity: 3,
+    countedQuantity: 4,
+    systemSellable: 3,
+    countedSellable: 3,
+    authorizerId: ownerSession.user.id,
+  }])
+
+  const replay = await apiRequest(`/api/owner/returns/${returnRequestId}/decision`, {
+    token: ownerSession.token,
+    method: 'POST',
+    body: {
+      decision: 'approved',
+      reason: 'Received and held for inspection',
+      items: [{
+        returnItemId,
+        receivedQuantity: 1,
+        disposition: 'quarantine',
+        restockSellable: false,
+        lawfulRestockConfirmed: false,
+      }],
+    },
+  })
+  assert.equal(replay.response.status, 200, replay.body?.error)
+  assert.equal(replay.body.idempotentReplay, true)
+
+  const inspectedOrder = await apiRequest('/api/orders', {
+    token: customerSession.token,
+    method: 'POST',
+    body: orderBody(medicine),
+    idempotencyKey: randomUUID(),
+  })
+  assert.equal(inspectedOrder.response.status, 201, inspectedOrder.body?.error)
+  const deliveredInspected = await deliverOrder(inspectedOrder.body.id)
+  const requestedInspected = await apiRequest('/api/me/returns', {
+    token: customerSession.token,
+    method: 'POST',
+    body: {
+      orderId: inspectedOrder.body.id,
+      reason: 'Package intact',
+      items: [{ orderItemId: deliveredInspected.items[0].orderItemId, quantity: 1 }],
+    },
+  })
+  assert.equal(requestedInspected.response.status, 201, requestedInspected.body?.error)
+  const inspectedReturn = requestedInspected.body.returnRequests[0]
+  const sellableRestock = await apiRequest(`/api/owner/returns/${inspectedReturn.id}/decision`, {
+    token: ownerSession.token,
+    method: 'POST',
+    body: {
+      decision: 'approved',
+      reason: 'Inspected; policy permits restock',
+      items: [{
+        returnItemId: inspectedReturn.items[0].id,
+        receivedQuantity: 1,
+        disposition: 'inspected',
+        restockSellable: true,
+        lawfulRestockConfirmed: true,
+      }],
+    },
+  })
+  assert.equal(sellableRestock.response.status, 200, sellableRestock.body?.error)
+  const afterInspection = await testPool.query(
+    `SELECT quantity_remaining AS "batchQuantity", quantity_blocked AS "blockedQuantity"
+     FROM inventory_batches WHERE medicine_id = $1`,
+    [medicine.id],
+  )
+  assert.deepEqual(afterInspection.rows[0], { batchQuantity: 4, blockedQuantity: 1 })
+})
+
 test('delivery verification limits wrong codes, locks attempts, and records no supplied code', async () => {
   const medicine = await createMedicine({ name: 'Delivery Lockout Strip', stock: 2 })
   const placed = await apiRequest('/api/orders', {
@@ -633,19 +935,20 @@ test('delivery verification limits wrong codes, locks attempts, and records no s
   })
 })
 
-test('orders allocate FEFO across batches and decline restores those same batches', async () => {
-  const medicine = await createMedicine({ name: 'FEFO Strip', stock: 4, price: 8 })
+test('orders allocate FEFO across valid batches and decline restores those same batches', async () => {
+  const medicine = await createMedicine({ name: 'FEFO Strip', stock: 6, price: 8 })
   await testPool.query(
     `UPDATE inventory_batches
      SET quantity_received = 0, quantity_remaining = 0
      WHERE medicine_id = $1`,
     [medicine.id],
   )
-  await testPool.query('UPDATE medicines SET stock = 4 WHERE id = $1', [medicine.id])
+  await testPool.query('UPDATE medicines SET stock = 6 WHERE id = $1', [medicine.id])
   await testPool.query(
     `INSERT INTO inventory_batches
       (medicine_id, batch_number, quantity_received, quantity_remaining, expiry_date)
-     VALUES ($1, 'FEFO-EARLY', 2, 2, '2030-01-01'),
+     VALUES ($1, 'FEFO-EXPIRED', 2, 2, CURRENT_DATE - 1),
+            ($1, 'FEFO-EARLY', 2, 2, '2030-01-01'),
             ($1, 'FEFO-LATE', 2, 2, '2032-01-01')`,
     [medicine.id],
   )
@@ -657,6 +960,8 @@ test('orders allocate FEFO across batches and decline restores those same batche
     idempotencyKey: randomUUID(),
   })
   assert.equal(response.status, 201, body?.error)
+  await testPool.query(`UPDATE sales_orders SET payment_status = 'paid' WHERE id = $1`, [body.id])
+  await testPool.query(`UPDATE payments SET status = 'paid' WHERE order_id = $1`, [body.id])
   const allocations = await testPool.query(
     `SELECT b.batch_number AS "batchNumber", a.quantity
      FROM order_item_batch_allocations a
@@ -685,6 +990,14 @@ test('orders allocate FEFO across batches and decline restores those same batche
   })))
   assert.deepEqual(declines.map(({ response }) => response.status), [200, 200])
   assert.equal(declines.filter(({ body: result }) => result.idempotentReplay).length, 1)
+  assert.equal(declines[0].body.returnRequests[0].type, 'cancellation')
+  assert.equal(declines[0].body.returnRequests[0].refundStatus, 'pending_reconciliation')
+  assert.equal(declines[0].body.returnRequests[0].refundAmount, body.total)
+  const paymentState = await testPool.query(
+    `SELECT payment_status AS "orderPaymentStatus" FROM sales_orders WHERE id = $1`,
+    [body.id],
+  )
+  assert.equal(paymentState.rows[0].orderPaymentStatus, 'paid')
   const restored = await testPool.query(
     `SELECT m.stock, b.batch_number AS "batchNumber", b.quantity_remaining AS "quantityRemaining"
      FROM medicines m JOIN inventory_batches b ON b.medicine_id = m.id
@@ -692,7 +1005,8 @@ test('orders allocate FEFO across batches and decline restores those same batche
     [medicine.id],
   )
   const quantities = new Map(restored.rows.map((row) => [row.batchNumber, row.quantityRemaining]))
-  assert.equal(restored.rows[0].stock, 4)
+  assert.equal(restored.rows[0].stock, 6)
+  assert.equal(quantities.get('FEFO-EXPIRED'), 2)
   assert.equal(quantities.get('FEFO-EARLY'), 2)
   assert.equal(quantities.get('FEFO-LATE'), 2)
   const movement = await testPool.query(
@@ -812,9 +1126,9 @@ test('decline refuses incomplete allocations and orders already dispatched', asy
 
 test('owner stock edits keep the medicine aggregate and batch balance aligned', async () => {
   const medicine = await createMedicine({ name: 'Owner Stock Edit', stock: 2, price: 9 })
-  const updateStock = async (stock) => apiRequest(`/api/medicines/${medicine.id}`, {
+  const updateStock = async (stock) => apiRequest(`/api/owner/medicines/${medicine.id}`, {
     token: ownerSession.token,
-    method: 'PUT',
+    method: 'PATCH',
     body: {
       name: medicine.name,
       category: 'Tablets',
@@ -847,6 +1161,532 @@ test('owner stock edits keep the medicine aggregate and batch balance aligned', 
   )
   assert.equal(result.rows[0].stock, 1)
   assert.equal(result.rows[0].batchStock, 1)
+})
+
+test('owner receipts record supplier cost, reconcile stock, and keep expired lots unsellable', async () => {
+  const medicine = await createMedicine({ name: 'Receipt Stock Test', stock: 0, price: 8 })
+  const expiryDate = (offsetDays) => new Date(Date.now() + offsetDays * 86400000).toISOString().slice(0, 10)
+  const receipt = (batchNumber, quantityReceived, expiry) => apiRequest('/api/owner/stock/receipts', {
+    token: ownerSession.token,
+    method: 'POST',
+    body: {
+      medicineId: medicine.id,
+      supplierName: 'Reliable Medical Supply',
+      batchNumber,
+      quantityReceived,
+      purchasePrice: 13.25,
+      expiryDate: expiry,
+      pharmacyId: 999999,
+    },
+  })
+
+  const expiredReceipt = await receipt('RCPT-EXPIRED', 4, expiryDate(-2))
+  assert.equal(expiredReceipt.response.status, 201, expiredReceipt.body?.error)
+  assert.equal(expiredReceipt.body.stock, 4)
+  const validReceipt = await receipt('RCPT-VALID', 3, expiryDate(365))
+  assert.equal(validReceipt.response.status, 201, validReceipt.body?.error)
+  assert.equal(validReceipt.body.stock, 7)
+  const duplicate = await receipt('RCPT-VALID', 5, expiryDate(365))
+  assert.equal(duplicate.response.status, 409)
+
+  const batches = await apiRequest(`/api/owner/medicines/${medicine.id}/batches`, {
+    token: ownerSession.token,
+  })
+  assert.equal(batches.response.status, 200)
+  assert.equal(batches.body.length, 2)
+  assert.equal(batches.body[0].batchNumber, 'RCPT-EXPIRED')
+  assert.equal(batches.body[0].supplierName, 'Reliable Medical Supply')
+  assert.equal(batches.body[0].purchasePrice, 13.25)
+  assert.equal(batches.body[0].isExpired, true)
+  assert.equal(batches.body[0].isSellable, false)
+  assert.equal(batches.body[1].isSellable, true)
+
+  const audit = await testPool.query(
+    `SELECT action, details->>'purchasePrice' AS "purchasePrice"
+     FROM audit_events
+     WHERE entity_type = 'inventory_batch' AND entity_id = $1`,
+    [validReceipt.body.batchId],
+  )
+  assert.deepEqual(audit.rows, [{ action: 'stock_received', purchasePrice: '13.25' }])
+  const purchaseMovement = await testPool.query(
+    `SELECT movement_type AS type, quantity_change AS quantity, note
+     FROM stock_movements WHERE inventory_batch_id = $1`,
+    [validReceipt.body.batchId],
+  )
+  assert.equal(purchaseMovement.rows[0].type, 'purchase')
+  assert.equal(purchaseMovement.rows[0].quantity, 3)
+  assert.match(purchaseMovement.rows[0].note, /purchase price 13\.25/)
+
+  const otherOwner = await apiRequest('/api/auth/signup', {
+    method: 'POST',
+    body: {
+      role: 'pharmacy_owner',
+      email: `receipt-owner-${process.pid}@example.test`,
+      password: 'order-test-password-2026',
+      fullName: 'Receipt Test Owner',
+      phone: '919876543210',
+      pharmacyName: 'Other Receipt Pharmacy',
+    },
+  })
+  assert.equal(otherOwner.response.status, 201, otherOwner.body?.error)
+  const crossPharmacyBatches = await apiRequest(`/api/owner/medicines/${medicine.id}/batches`, {
+    token: otherOwner.body.token,
+  })
+  assert.equal(crossPharmacyBatches.response.status, 404)
+  const crossPharmacyReceipt = await apiRequest('/api/owner/stock/receipts', {
+    token: otherOwner.body.token,
+    method: 'POST',
+    body: {
+      medicineId: medicine.id,
+      supplierName: 'Other Supplier',
+      batchNumber: 'OTHER-LOT',
+      quantityReceived: 1,
+      purchasePrice: 1,
+      expiryDate: expiryDate(365),
+    },
+  })
+  assert.equal(crossPharmacyReceipt.response.status, 404)
+
+  const unavailable = await apiRequest('/api/orders', {
+    token: customerSession.token,
+    method: 'POST',
+    body: orderBody(medicine, 4),
+    idempotencyKey: randomUUID(),
+  })
+  assert.equal(unavailable.response.status, 409)
+  const placed = await apiRequest('/api/orders', {
+    token: customerSession.token,
+    method: 'POST',
+    body: orderBody(medicine, 3),
+    idempotencyKey: randomUUID(),
+  })
+  assert.equal(placed.response.status, 201, placed.body?.error)
+  const allocations = await testPool.query(
+    `SELECT b.batch_number AS "batchNumber", a.quantity
+     FROM order_item_batch_allocations a
+     JOIN inventory_batches b ON b.id = a.inventory_batch_id
+     JOIN sales_order_items i ON i.id = a.order_item_id
+     WHERE i.order_id = $1`,
+    [placed.body.id],
+  )
+  assert.deepEqual(allocations.rows, [{ batchNumber: 'RCPT-VALID', quantity: 3 }])
+  const reconciledStock = await testPool.query(
+    `SELECT m.stock, SUM(b.quantity_remaining)::int AS "batchStock"
+     FROM medicines m JOIN inventory_batches b ON b.medicine_id = m.id
+     WHERE m.id = $1 GROUP BY m.id`,
+    [medicine.id],
+  )
+  assert.equal(reconciledStock.rows[0].stock, 4)
+  assert.equal(reconciledStock.rows[0].batchStock, 4)
+})
+
+test('owner medicine routes scope edits, audit price changes, and deactivate without losing snapshots', async () => {
+  const medicine = await createMedicine({ name: 'Owner Scoped Product', stock: 3, price: 10 })
+  assert.equal(medicine.pharmacyId, ownerSession.user.pharmacyId)
+  await testPool.query(
+    `UPDATE pharmacies SET approval_status = 'approved' WHERE id = $1`,
+    [ownerSession.user.pharmacyId],
+  )
+
+  const otherOwner = await apiRequest('/api/auth/signup', {
+    method: 'POST',
+    body: {
+      role: 'pharmacy_owner',
+      email: `product-owner-${process.pid}@example.test`,
+      password: 'order-test-password-2026',
+      fullName: 'Product Test Owner',
+      phone: '918812345678',
+      pharmacyName: 'Other Product Pharmacy',
+    },
+  })
+  assert.equal(otherOwner.response.status, 201, otherOwner.body?.error)
+  const crossPharmacyEdit = await apiRequest(`/api/owner/medicines/${medicine.id}`, {
+    token: otherOwner.body.token,
+    method: 'PATCH',
+    body: { ...medicine, price: 99 },
+  })
+  assert.equal(crossPharmacyEdit.response.status, 404)
+
+  const invalidIdentifier = await apiRequest('/api/owner/medicines/1e0', {
+    token: ownerSession.token,
+    method: 'PATCH',
+    body: { ...medicine },
+  })
+  assert.equal(invalidIdentifier.response.status, 400)
+  const invalidPrice = await apiRequest(`/api/owner/medicines/${medicine.id}`, {
+    token: ownerSession.token,
+    method: 'PATCH',
+    body: { ...medicine, price: 10.001 },
+  })
+  assert.equal(invalidPrice.response.status, 400)
+  const invalidReorderLevel = await apiRequest(`/api/owner/medicines/${medicine.id}`, {
+    token: ownerSession.token,
+    method: 'PATCH',
+    body: { ...medicine, reorderLevel: 1.5 },
+  })
+  assert.equal(invalidReorderLevel.response.status, 400)
+  const invalidSku = await apiRequest('/api/owner/medicines', {
+    token: ownerSession.token,
+    method: 'POST',
+    body: {
+      ...medicine,
+      name: 'Malformed SKU Product',
+      sku: 'bad sku!',
+    },
+  })
+  assert.equal(invalidSku.response.status, 400)
+
+  const edited = await apiRequest(`/api/owner/medicines/${medicine.id}`, {
+    token: ownerSession.token,
+    method: 'PATCH',
+    body: { ...medicine, price: 12.75 },
+  })
+  assert.equal(edited.response.status, 200, edited.body?.error)
+  assert.equal(edited.body.price, 12.75)
+  const priceAudit = await testPool.query(
+    `SELECT action, details->>'fromPrice' AS "fromPrice", details->>'toPrice' AS "toPrice"
+     FROM audit_events
+     WHERE entity_type = 'medicine' AND entity_id = $1 AND action = 'medicine_price_changed'`,
+    [medicine.id],
+  )
+  assert.equal(priceAudit.rowCount, 1)
+  assert.equal(priceAudit.rows[0].fromPrice, '10')
+  assert.equal(priceAudit.rows[0].toPrice, '12.75')
+
+  const placed = await apiRequest('/api/orders', {
+    token: customerSession.token,
+    method: 'POST',
+    body: orderBody(edited.body),
+    idempotencyKey: randomUUID(),
+  })
+  assert.equal(placed.response.status, 201, placed.body?.error)
+  const catalogBeforeDeactivate = await apiRequest(
+    `/api/catalog/medicines?pharmacyId=${medicine.pharmacyId}&q=${encodeURIComponent(medicine.name)}`,
+  )
+  assert.equal(catalogBeforeDeactivate.body.some((item) => item.id === medicine.id), true)
+
+  const deactivated = await apiRequest(`/api/owner/medicines/${medicine.id}/deactivate`, {
+    token: ownerSession.token,
+    method: 'POST',
+  })
+  assert.equal(deactivated.response.status, 204)
+  const catalogAfterDeactivate = await apiRequest(
+    `/api/catalog/medicines?pharmacyId=${medicine.pharmacyId}&q=${encodeURIComponent(medicine.name)}`,
+  )
+  assert.equal(catalogAfterDeactivate.body.some((item) => item.id === medicine.id), false)
+  const history = await testPool.query(
+    `SELECT i.medicine_name, i.unit_price::float8 AS "unitPrice",
+       i.medicine_snapshot->>'sku' AS sku, m.is_active
+     FROM sales_orders o
+     JOIN sales_order_items i ON i.order_id = o.id
+     JOIN medicines m ON m.id = i.medicine_id
+     WHERE o.id = $1 AND i.medicine_id = $2`,
+    [placed.body.id, medicine.id],
+  )
+  assert.equal(history.rowCount, 1)
+  assert.equal(history.rows[0].medicine_name, medicine.name)
+  assert.equal(history.rows[0].unitPrice, 12.75)
+  assert.equal(history.rows[0].sku, medicine.sku)
+  assert.equal(history.rows[0].is_active, false)
+})
+
+test('approved product comparison and customer refill reminders work from catalog IDs', async () => {
+  await testPool.query(
+    `UPDATE pharmacies SET approval_status = 'approved' WHERE id = $1`,
+    [ownerSession.user.pharmacyId],
+  )
+  const medicine = await createMedicine({ name: 'Catalog Reminder Demo', stock: 4 })
+  const medicineDetails = await apiRequest(`/api/medicines/${medicine.id}`)
+  assert.equal(medicineDetails.response.status, 200, medicineDetails.body?.error)
+  assert.equal(medicineDetails.body.medicine.expiryDate, '2035-01-01')
+  const comparison = await apiRequest(`/api/catalog/compare?productKey=${medicine.id}`)
+  assert.equal(comparison.response.status, 200, comparison.body?.error)
+  assert.equal(comparison.body.product.id, medicine.id)
+  assert.ok(comparison.body.listings.some((listing) => listing.medicineId === medicine.id))
+
+  const reminder = await apiRequest('/api/me/reminders', {
+    token: customerSession.token,
+    method: 'POST',
+    body: {
+      medicineId: medicine.id,
+      pharmacyId: medicine.pharmacyId,
+      nextReminderDate: '2099-12-31',
+      intervalDays: 30,
+    },
+  })
+  assert.equal(reminder.response.status, 201, reminder.body?.error)
+  assert.equal(reminder.body.pharmacyId, medicine.pharmacyId)
+  assert.equal(reminder.body.nextReminderDate, '2099-12-31')
+  assert.equal(reminder.body.optIn, true)
+
+  const saved = await apiRequest('/api/me/reminders', { token: customerSession.token })
+  assert.equal(saved.response.status, 200)
+  assert.equal(saved.body.reminders.find((item) => item.id === reminder.body.id)?.nextReminderDate, '2099-12-31')
+
+  const cancelled = await apiRequest(`/api/me/reminders/${reminder.body.id}`, {
+    token: customerSession.token,
+    method: 'PATCH',
+    body: { optIn: false },
+  })
+  assert.equal(cancelled.response.status, 200, cancelled.body?.error)
+  assert.equal(cancelled.body.optIn, false)
+})
+
+test('confirmed checkout quotes can be placed as orders', async () => {
+  await testPool.query(
+    `UPDATE pharmacies SET approval_status = 'approved' WHERE id = $1`,
+    [ownerSession.user.pharmacyId],
+  )
+  const medicine = await createMedicine({ name: 'Confirmed Checkout Demo', stock: 3, price: 12 })
+  const checkout = {
+    items: [{ medicineId: medicine.id, pharmacy_id: medicine.pharmacyId, quantity: 1 }],
+    paymentMethod: 'Cash on Delivery',
+    fulfillmentMethod: 'pickup',
+    discountCode: null,
+  }
+  const quote = await apiRequest('/api/checkout/quote', {
+    token: customerSession.token,
+    method: 'POST',
+    body: checkout,
+  })
+  assert.equal(quote.response.status, 200, quote.body?.error)
+  assert.equal(quote.body.pharmacyId, medicine.pharmacyId)
+
+  const placed = await apiRequest('/api/orders', {
+    token: customerSession.token,
+    method: 'POST',
+    body: { ...checkout, quoteId: quote.body.quoteId },
+    idempotencyKey: randomUUID(),
+  })
+  assert.equal(placed.response.status, 201, placed.body?.error)
+  assert.equal(placed.body.status, 'pending')
+  assert.equal(placed.body.fulfillmentMethod, 'pickup')
+  const stock = await testPool.query('SELECT stock FROM medicines WHERE id = $1', [medicine.id])
+  assert.equal(stock.rows[0].stock, 2)
+})
+
+test('owner dashboard aggregates batch stock, expiry, pending orders, and collected payments', async () => {
+  const medicine = await createMedicine({ name: 'Owner Dashboard Batch', stock: 4, price: 37.5 })
+  await testPool.query(
+    `UPDATE medicines SET reorder_level = 5 WHERE id = $1`,
+    [medicine.id],
+  )
+  await testPool.query(
+    `UPDATE inventory_batches SET expiry_date = (now() AT TIME ZONE 'UTC')::date + 5
+     WHERE medicine_id = $1`,
+    [medicine.id],
+  )
+
+  const placed = await apiRequest('/api/orders', {
+    token: customerSession.token,
+    method: 'POST',
+    body: orderBody(medicine),
+    idempotencyKey: randomUUID(),
+  })
+  assert.equal(placed.response.status, 201, placed.body?.error)
+  const order = await testPool.query(
+    `SELECT id, total FROM sales_orders WHERE pharmacy_id = $1 ORDER BY id DESC LIMIT 1`,
+    [ownerSession.user.pharmacyId],
+  )
+  await testPool.query(`UPDATE payments SET status = 'paid' WHERE order_id = $1`, [order.rows[0].id])
+
+  const [dashboard, alerts, rawTotals] = await Promise.all([
+    apiRequest('/api/owner/dashboard?range=week', { token: ownerSession.token }),
+    apiRequest('/api/owner/alerts', { token: ownerSession.token }),
+    testPool.query(
+      `WITH medicine_stock AS (
+         SELECT m.id, m.reorder_level,
+           CASE
+             WHEN m.expiry_date IS NOT NULL AND m.expiry_date < (now() AT TIME ZONE 'UTC')::date THEN 0
+             WHEN EXISTS (SELECT 1 FROM inventory_batches ib WHERE ib.medicine_id = m.id)
+               THEN LEAST(m.stock, COALESCE((
+                 SELECT SUM(ib.quantity_remaining - ib.quantity_blocked)::int
+                 FROM inventory_batches ib
+                 WHERE ib.medicine_id = m.id AND ib.quantity_remaining > ib.quantity_blocked
+                   AND (ib.expiry_date IS NULL OR ib.expiry_date >= (now() AT TIME ZONE 'UTC')::date)
+               ), 0))
+             ELSE m.stock
+           END AS sellable_stock
+         FROM medicines m WHERE m.pharmacy_id = $1 AND m.is_active
+       )
+       SELECT
+         (SELECT COUNT(*)::int FROM medicine_stock) AS "activeMedicines",
+         (SELECT COALESCE(SUM(sellable_stock), 0)::int FROM medicine_stock) AS "sellableUnits",
+         (SELECT COUNT(*)::int FROM medicine_stock
+          WHERE sellable_stock > 0 AND sellable_stock <= reorder_level) AS "lowStock",
+         (SELECT COUNT(*)::int FROM medicine_stock WHERE sellable_stock = 0) AS "outOfStock",
+         (SELECT COUNT(*)::int FROM sales_orders WHERE pharmacy_id = $1 AND status = 'pending') AS pending,
+         (SELECT COUNT(*)::int FROM inventory_batches ib JOIN medicines m ON m.id = ib.medicine_id
+          WHERE m.pharmacy_id = $1 AND m.is_active AND ib.quantity_remaining > ib.quantity_blocked
+            AND ib.expiry_date >= (now() AT TIME ZONE 'UTC')::date
+            AND ib.expiry_date <= (now() AT TIME ZONE 'UTC')::date + 7) AS "batches7Days",
+         (SELECT COALESCE(SUM(ib.quantity_remaining - ib.quantity_blocked), 0)::int FROM inventory_batches ib JOIN medicines m ON m.id = ib.medicine_id
+          WHERE m.pharmacy_id = $1 AND m.is_active AND ib.quantity_remaining > ib.quantity_blocked
+            AND ib.expiry_date >= (now() AT TIME ZONE 'UTC')::date
+            AND ib.expiry_date <= (now() AT TIME ZONE 'UTC')::date + 7) AS "units7Days",
+         (SELECT COALESCE(SUM(total), 0)::float8 FROM sales_orders
+          WHERE pharmacy_id = $1 AND created_at >= date_trunc('day', now()) - INTERVAL '6 days'
+            AND status NOT IN ('cancelled', 'declined')) AS gross,
+         (SELECT COALESCE(SUM(p.amount), 0)::float8 FROM payments p
+          JOIN sales_orders o ON o.id = p.order_id
+          WHERE o.pharmacy_id = $1 AND p.status = 'paid'
+            AND p.created_at >= date_trunc('day', now()) - INTERVAL '6 days') AS collected`,
+      [ownerSession.user.pharmacyId],
+    ),
+  ])
+  assert.equal(dashboard.response.status, 200, dashboard.body?.error)
+  assert.equal(alerts.response.status, 200, alerts.body?.error)
+  assert.equal(dashboard.body.kpis.activeMedicines, rawTotals.rows[0].activeMedicines)
+  assert.equal(dashboard.body.kpis.sellableUnits, rawTotals.rows[0].sellableUnits)
+  assert.equal(dashboard.body.kpis.lowStock, rawTotals.rows[0].lowStock)
+  assert.equal(dashboard.body.kpis.outOfStock, rawTotals.rows[0].outOfStock)
+  assert.equal(dashboard.body.kpis.pendingOrders, rawTotals.rows[0].pending)
+  assert.equal(dashboard.body.kpis.batches7Days, rawTotals.rows[0].batches7Days)
+  assert.equal(dashboard.body.kpis.units7Days, rawTotals.rows[0].units7Days)
+  assert.ok(Math.abs(dashboard.body.sales.reduce((sum, point) => sum + point.grossSales, 0) - rawTotals.rows[0].gross) < 0.005)
+  assert.ok(Math.abs(dashboard.body.sales.reduce((sum, point) => sum + point.collectedPayments, 0) - rawTotals.rows[0].collected) < 0.005)
+  assert.equal(alerts.body.lowStock.some((item) => item.medicineId === medicine.id), true)
+  assert.equal(alerts.body.expiringBatches.some((batch) => batch.medicineId === medicine.id), true)
+
+  for (const range of ['today', 'month']) {
+    const rangedDashboard = await apiRequest(`/api/owner/dashboard?range=${range}`, { token: ownerSession.token })
+    assert.equal(rangedDashboard.response.status, 200, rangedDashboard.body?.error)
+    assert.equal(rangedDashboard.body.range, range)
+    assert.ok(rangedDashboard.body.sales.length > 0)
+  }
+
+  const secondOwner = await apiRequest('/api/auth/signup', {
+    method: 'POST',
+    body: {
+      role: 'pharmacy_owner',
+      email: `isolated-owner-${process.pid}@example.test`,
+      password: 'order-test-password-2026',
+      fullName: 'Isolated Dashboard Owner',
+      phone: '919876543210',
+      pharmacyName: 'Isolated Dashboard Pharmacy',
+    },
+  })
+  assert.equal(secondOwner.response.status, 201, secondOwner.body?.error)
+  const isolatedDashboard = await apiRequest('/api/owner/dashboard', { token: secondOwner.body.token })
+  assert.equal(isolatedDashboard.response.status, 200, isolatedDashboard.body?.error)
+  assert.equal(isolatedDashboard.body.kpis.activeMedicines, 0)
+  assert.equal(isolatedDashboard.body.kpis.sellableUnits, 0)
+  assert.equal(isolatedDashboard.body.kpis.pendingOrders, 0)
+  assert.equal(isolatedDashboard.body.recentStockMovements.length, 0)
+  assert.equal(isolatedDashboard.body.recentOrderEvents.length, 0)
+
+  const invalidRange = await apiRequest('/api/owner/dashboard?range=year', { token: ownerSession.token })
+  assert.equal(invalidRange.response.status, 400)
+})
+
+test('owner expiry risk uses UTC cutoffs and inventory counts are authorized and atomic', async () => {
+  const timezoneCheck = await testPool.connect()
+  let utcDateInKiritimati
+  let utcDateInAdak
+  try {
+    await timezoneCheck.query('BEGIN')
+    await timezoneCheck.query("SET LOCAL TIME ZONE 'Pacific/Kiritimati'")
+    utcDateInKiritimati = (await timezoneCheck.query(
+      `SELECT (now() AT TIME ZONE 'UTC')::date::text AS utc_date`,
+    )).rows[0].utc_date
+    await timezoneCheck.query("SET LOCAL TIME ZONE 'America/Adak'")
+    utcDateInAdak = (await timezoneCheck.query(
+      `SELECT (now() AT TIME ZONE 'UTC')::date::text AS utc_date`,
+    )).rows[0].utc_date
+    await timezoneCheck.query('ROLLBACK')
+  } finally {
+    timezoneCheck.release()
+  }
+  assert.equal(utcDateInKiritimati, utcDateInAdak)
+
+  const medicine = await createMedicine({ name: 'Audited Expiry Batch', stock: 10 })
+  await testPool.query('UPDATE medicines SET reorder_level = 9 WHERE id = $1', [medicine.id])
+  const batchResult = await testPool.query(
+    `UPDATE inventory_batches
+     SET expiry_date = (now() AT TIME ZONE 'UTC')::date + 7, purchase_price = 2.50
+     WHERE medicine_id = $1
+     RETURNING id::int AS id`,
+    [medicine.id],
+  )
+  const batchId = batchResult.rows[0].id
+
+  const unauthorized = await apiRequest('/api/owner/expiry')
+  assert.equal(unauthorized.response.status, 401)
+
+  const expiry = await apiRequest('/api/owner/expiry', { token: ownerSession.token })
+  assert.equal(expiry.response.status, 200, expiry.body?.error)
+  const expiringBatch = expiry.body.batches.find((batch) => batch.batchId === batchId)
+  assert.ok(expiringBatch)
+  assert.equal(expiringBatch.daysUntilExpiry, 7)
+  assert.equal(expiringBatch.sellableQuantity, 10)
+  assert.equal(expiringBatch.purchaseCostAtRisk, 25)
+  assert.ok(expiry.body.summary.batches7Days >= 1)
+
+  const counted = await apiRequest('/api/owner/inventory-audits', {
+    token: ownerSession.token,
+    method: 'POST',
+    body: {
+      reason: 'Physical count found two additional units',
+      authorizerUserId: 999999,
+      items: [{ medicineId: medicine.id, batchId, countedQuantity: 12, countedSellableQuantity: 9 }],
+    },
+  })
+  assert.equal(counted.response.status, 201, counted.body?.error)
+  assert.equal(counted.body.authorizer, ownerSession.user.fullName)
+  assert.equal(counted.body.adjustments[0].quantityChange, 2)
+  assert.equal(counted.body.adjustments[0].sellableQuantityChange, -1)
+
+  const databaseState = await testPool.query(
+    `SELECT m.stock, b.quantity_remaining, b.quantity_blocked,
+       a.system_quantity, a.counted_quantity, a.system_sellable_quantity,
+       a.counted_sellable_quantity, a.authorizer_user_id::int AS authorizer_user_id, a.authorizer_name
+     FROM medicines m
+     JOIN inventory_batches b ON b.medicine_id = m.id
+     JOIN inventory_audits a ON a.inventory_batch_id = b.id
+     WHERE b.id = $1`,
+    [batchId],
+  )
+  assert.equal(databaseState.rows[0].stock, 12)
+  assert.equal(databaseState.rows[0].quantity_remaining, 12)
+  assert.equal(databaseState.rows[0].quantity_blocked, 3)
+  assert.equal(databaseState.rows[0].system_quantity, 10)
+  assert.equal(databaseState.rows[0].counted_quantity, 12)
+  assert.equal(databaseState.rows[0].system_sellable_quantity, 10)
+  assert.equal(databaseState.rows[0].counted_sellable_quantity, 9)
+  assert.equal(databaseState.rows[0].authorizer_user_id, ownerSession.user.id)
+  assert.equal(databaseState.rows[0].authorizer_name, ownerSession.user.fullName)
+
+  const lowStock = await apiRequest('/api/owner/low-stock', { token: ownerSession.token })
+  assert.equal(lowStock.response.status, 200, lowStock.body?.error)
+  assert.equal(lowStock.body.lowStock.some((item) => item.medicineId === medicine.id && item.sellableStock === 9), true)
+
+  const updatedExpiry = await apiRequest('/api/owner/expiry', { token: ownerSession.token })
+  const updatedBatch = updatedExpiry.body.batches.find((batch) => batch.batchId === batchId)
+  assert.equal(updatedBatch.sellableQuantity, 9)
+  assert.equal(updatedBatch.purchaseCostAtRisk, 22.5)
+
+  await testPool.query(
+    `UPDATE inventory_batches SET expiry_date = (now() AT TIME ZONE 'UTC')::date - 1 WHERE id = $1`,
+    [batchId],
+  )
+  const expiredCount = await apiRequest('/api/owner/inventory-audits', {
+    token: ownerSession.token,
+    method: 'POST',
+    body: {
+      reason: 'Attempt to mark expired units sellable',
+      items: [{ medicineId: medicine.id, batchId, countedQuantity: 12, countedSellableQuantity: 1 }],
+    },
+  })
+  assert.equal(expiredCount.response.status, 400)
+  assert.match(expiredCount.body.error, /Expired inventory cannot be marked sellable/)
+  const unchanged = await testPool.query(
+    `SELECT quantity_remaining, quantity_blocked, (SELECT COUNT(*)::int FROM inventory_audits WHERE inventory_batch_id = $1) AS audit_count
+     FROM inventory_batches WHERE id = $1`,
+    [batchId],
+  )
+  assert.equal(unchanged.rows[0].quantity_remaining, 12)
+  assert.equal(unchanged.rows[0].quantity_blocked, 3)
+  assert.equal(unchanged.rows[0].audit_count, 1)
 })
 
 test('only delivered buyers can create one order-linked review per medicine', async () => {

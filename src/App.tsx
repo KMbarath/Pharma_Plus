@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import { motion } from 'framer-motion'
 import ArrowLeft from 'lucide-react/icons/arrow-left'
 import ArrowUpRight from 'lucide-react/icons/arrow-up-right'
@@ -35,7 +35,10 @@ import Trash2 from 'lucide-react/icons/trash-2'
 import type { LucideIcon } from 'lucide-react'
 import { BrowserRouter, Navigate, NavLink, Route, Routes, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { customerText, supportedCustomerLocales, type CustomerLocale } from './i18n'
+import type { OwnerSalesPoint } from './OwnerSalesChart'
 import './ReferenceDesign.css'
+
+const OwnerSalesChart = lazy(() => import('./OwnerSalesChart'))
 
 type Product = {
   id: number
@@ -91,6 +94,7 @@ type InventoryRecord = {
   pack: string
   price: number
   stock: number
+  availableQuantity: number
   reorderLevel: number
   expiry: string | null
   sku: string | null
@@ -116,6 +120,33 @@ type StockMovement = {
   medicineId: number
   medicineName: string
   sku: string | null
+}
+
+type InventoryBatch = {
+  id: number
+  medicineId: number
+  batchNumber: string
+  supplierName: string | null
+  quantityReceived: number
+  quantityRemaining: number
+  quantityBlocked: number
+  sellableQuantity: number
+  purchasePrice: number
+  expiryDate: string | null
+  receivedAt: string
+  isExpired: boolean
+  isSellable: boolean
+}
+
+type InventoryCountLine = {
+  batchId: number
+  batchNumber: string
+  expiryDate: string | null
+  isExpired: boolean
+  systemQuantity: number
+  systemSellableQuantity: number
+  countedQuantity: string
+  countedSellableQuantity: string
 }
 
 type StockMovementSummary = StockMovement & {
@@ -178,6 +209,14 @@ type MedicineForm = {
   prescriptionRequired: boolean
   description: string
   imageUrl: string
+}
+
+type StockReceiptForm = {
+  supplierName: string
+  batchNumber: string
+  quantityReceived: string
+  purchasePrice: string
+  expiryDate: string
 }
 
 type AccountRole = 'customer' | 'pharmacy_owner' | 'admin'
@@ -324,6 +363,27 @@ type OrderEvent = {
   note: string | null
 }
 
+type CustomerReturnRequest = {
+  id: number
+  type: 'cancellation' | 'return'
+  status: 'requested' | 'approved' | 'rejected'
+  reason: string
+  decisionReason: string | null
+  refundAmount: number
+  refundStatus: 'not_required' | 'pending_reconciliation' | 'reconciled'
+  createdAt: string
+  items: Array<{
+    id: number
+    orderItemId: number
+    name: string
+    requestedQuantity: number
+    receivedQuantity: number
+    disposition: 'quarantine' | 'damaged' | 'non_returnable' | 'inspected' | null
+    restockSellable: boolean
+    prescriptionRequired: boolean
+  }>
+}
+
 type OrderNotification = {
   id: number
   type: 'order_placed' | 'order_status' | 'refill_reminder' | 'stock_available'
@@ -364,6 +424,7 @@ type CustomerOrder = {
   createdAt: string
   updatedAt: string
   items: Array<{
+    orderItemId: number
     medicineId: number
     name: string
     quantity: number
@@ -379,6 +440,7 @@ type CustomerOrder = {
     snapshot?: Record<string, unknown>
   }>
   events: OrderEvent[]
+  returnRequests: CustomerReturnRequest[]
   idempotentReplay?: boolean
 }
 
@@ -663,6 +725,18 @@ const emptyMedicineForm = (): MedicineForm => ({
   description: '',
   imageUrl: '',
 })
+
+function isValidOwnerImageUrl(imageUrl: string) {
+  if (imageUrl.startsWith('/') && !imageUrl.startsWith('//') && !imageUrl.includes('\\')) {
+    return !imageUrl.split('/').includes('..')
+  }
+  try {
+    const url = new URL(imageUrl)
+    return url.protocol === 'https:' && !url.username && !url.password
+  } catch {
+    return false
+  }
+}
 
 const categories = [
   { name: 'Tablets', icon: '💊' },
@@ -991,7 +1065,9 @@ function ApplicationRoutes({
       }
       try {
         const response = await authenticatedApiFetch('/api/auth/session', token)
-        const result = await response.json() as SessionResponse
+        const result = await response.json().catch(() => {
+          throw new Error('The Pharma Plus API is unavailable. Restart the app with npm run dev and check the API terminal for startup errors.')
+        }) as SessionResponse
         if (response.status === 401) {
           localStorage.removeItem(SESSION_STORAGE_KEY)
           return
@@ -1779,6 +1855,143 @@ function OrderNotificationsPage({
   )
 }
 
+function CustomerOrderActions({
+  order,
+  token,
+  onUpdated,
+}: {
+  order: CustomerOrder
+  token: string
+  onUpdated: (order: CustomerOrder) => void
+}) {
+  const [cancelReason, setCancelReason] = useState('')
+  const [returnReason, setReturnReason] = useState('')
+  const [returnQuantities, setReturnQuantities] = useState<Record<number, string>>({})
+  const [showReturnForm, setShowReturnForm] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
+  const [message, setMessage] = useState('')
+  const returnRequests = order.returnRequests ?? []
+  const hasValidReturnQuantity = order.items.some((item) => {
+    const quantity = Number(returnQuantities[item.orderItemId] ?? 0)
+    return Number.isSafeInteger(quantity) && quantity > 0 && quantity <= item.quantity
+  })
+  const activeReturn = returnRequests.some((request) =>
+    request.type === 'return' && ['requested', 'approved'].includes(request.status),
+  )
+
+  const submit = async (kind: 'cancel' | 'return') => {
+    setSaving(true)
+    setError('')
+    setMessage('')
+    try {
+      const body = kind === 'cancel'
+        ? { reason: cancelReason.trim() }
+        : {
+          orderId: order.id,
+          reason: returnReason.trim(),
+          items: order.items
+            .map((item) => ({
+              orderItemId: item.orderItemId,
+              quantity: Number(returnQuantities[item.orderItemId] ?? 0),
+            }))
+            .filter((item) => item.quantity > 0),
+        }
+      const response = await authenticatedApiFetch(
+        kind === 'cancel' ? `/api/me/orders/${order.id}/cancel` : '/api/me/returns',
+        token,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        },
+      )
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.error || 'Could not save your request.')
+      onUpdated(result as CustomerOrder)
+      setMessage(kind === 'cancel' ? 'Your order was cancelled.' : 'Your return request was sent to the pharmacy.')
+      setCancelReason('')
+      setReturnReason('')
+      setReturnQuantities({})
+      setShowReturnForm(false)
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Could not save your request.')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <section className="customer-order-actions" aria-label="Cancellation and return options">
+      {order.status === 'pending' && !returnRequests.some((request) => request.type === 'cancellation') && (
+        <form className="order-request-form" onSubmit={(event) => { event.preventDefault(); void submit('cancel') }}>
+          <label>
+            Cancel reason
+            <textarea required minLength={3} maxLength={1000} rows={2} value={cancelReason} onChange={(event) => setCancelReason(event.target.value)} />
+          </label>
+          <button type="submit" className="decline-action" disabled={saving || cancelReason.trim().length < 3}>
+            {saving ? 'Cancelling…' : 'Cancel pending order'}
+          </button>
+        </form>
+      )}
+      {order.status === 'delivered' && !activeReturn && (
+        <div className="order-request-form">
+          {!showReturnForm ? (
+            <button type="button" className="order-secondary-action" onClick={() => setShowReturnForm(true)}>Request a return</button>
+          ) : (
+            <form onSubmit={(event) => { event.preventDefault(); void submit('return') }}>
+              <p>Return requests must be submitted within 24 hours of delivery. You can return part of an item quantity; the pharmacy will confirm received quantities.</p>
+              {order.items.map((item) => (
+                <label className="return-quantity-row" key={item.orderItemId}>
+                  <span>{item.name} (ordered: {item.quantity})</span>
+                  <input
+                    type="number"
+                    min="0"
+                    max={item.quantity}
+                    step="1"
+                    value={returnQuantities[item.orderItemId] ?? '0'}
+                    onChange={(event) => setReturnQuantities((current) => ({ ...current, [item.orderItemId]: event.target.value }))}
+                  />
+                </label>
+              ))}
+              <label>
+                Return reason
+                <textarea required minLength={3} maxLength={1000} rows={2} value={returnReason} onChange={(event) => setReturnReason(event.target.value)} />
+              </label>
+              <div className="order-request-actions">
+                <button type="button" className="order-secondary-action" onClick={() => setShowReturnForm(false)}>Keep order</button>
+                <button
+                  type="submit"
+                  className="accept-action"
+                  disabled={saving || returnReason.trim().length < 3 || !hasValidReturnQuantity}
+                >
+                  {saving ? 'Sending…' : 'Send return request'}
+                </button>
+              </div>
+            </form>
+          )}
+        </div>
+      )}
+      {returnRequests.map((request) => (
+        <div className="order-return-status" key={request.id}>
+          <strong>{request.type === 'cancellation' ? 'Cancellation' : 'Return'} · {request.type === 'cancellation' && request.status === 'approved' ? 'cancelled' : request.status.replace('_', ' ')}</strong>
+          <span>{request.reason}</span>
+          {request.items.map((item) => (
+            <small key={item.id}>{item.name}: requested {item.requestedQuantity}{request.status !== 'requested' ? `, received ${item.receivedQuantity}` : ''}{item.restockSellable ? ' · inspected and restocked' : item.receivedQuantity > 0 ? ' · held non-sellable' : ''}</small>
+          ))}
+          {request.decisionReason && <small>Pharmacy: {request.decisionReason}</small>}
+          {request.refundStatus === 'pending_reconciliation' && (
+            <small>Refund of ₹{request.refundAmount.toLocaleString('en-IN')} is awaiting payment-provider reconciliation; it has not been marked paid.</small>
+          )}
+          {request.refundStatus === 'reconciled' && <small>Refund reconciled: ₹{request.refundAmount.toLocaleString('en-IN')}</small>}
+        </div>
+      ))}
+      {message && <p className="order-request-message" role="status">{message}</p>}
+      {error && <p className="owner-form-error" role="alert">{error}</p>}
+    </section>
+  )
+}
+
 function CustomerOrdersPage({ session }: { session: AccountSession }) {
   const navigate = useNavigate()
   const [orders, setOrders] = useState<CustomerOrder[]>([])
@@ -1861,7 +2074,7 @@ function CustomerOrdersPage({ session }: { session: AccountSession }) {
                     {order.items.map((item) => (
                       <button
                         type="button"
-                        key={`${order.id}-review-${item.medicineId}`}
+                        key={`${order.id}-review-${item.orderItemId}`}
                         onClick={() => navigate(`/product/${item.medicineId}/reviews`)}
                       >
                         Review {item.name}
@@ -1869,6 +2082,13 @@ function CustomerOrdersPage({ session }: { session: AccountSession }) {
                     ))}
                   </div>
                 )}
+                <CustomerOrderActions
+                  order={order}
+                  token={session.token}
+                  onUpdated={(updatedOrder) => setOrders((current) =>
+                    current.map((entry) => entry.id === updatedOrder.id ? updatedOrder : entry),
+                  )}
+                />
                 <div className="customer-order-total"><span>Total</span><strong>₹{order.total.toLocaleString('en-IN')}</strong></div>
                 <OrderTimeline order={order} />
                 <button type="button" className="track-order-button" onClick={() => navigate(`/orders/${order.id}`)}>View tracking <ArrowUpRight className="icon" /></button>
@@ -3961,7 +4181,9 @@ function AuthenticationPage({
           ? signupBody
           : { email: form.email, password: form.password, role }),
       })
-      const result = await response.json()
+      const result = await response.json().catch(() => {
+        throw new Error('The Pharma Plus API is unavailable. Restart the app with npm run dev and check the API terminal for startup errors.')
+      })
       if (!response.ok) throw new Error(result.error || 'Could not sign in.')
       onAuthenticated(result as AccountSession)
     } catch (error) {
@@ -4121,7 +4343,7 @@ function AdminPage({ session, onSignOut }: { session: AccountSession; onSignOut:
   const [pending, setPending] = useState<PendingPharmacy[]>([])
   const [error, setError] = useState('')
   useEffect(() => { void Promise.all([authenticatedApiFetch('/api/admin/overview', session.token), authenticatedApiFetch('/api/admin/pharmacies/pending', session.token)]).then(async ([overviewResponse, pendingResponse]) => { const result = await overviewResponse.json(); const applications = await pendingResponse.json(); if (!overviewResponse.ok) throw new Error(result.error); if (!pendingResponse.ok) throw new Error(applications.error); setData(result); setPending(applications) }).catch((reason) => setError(reason instanceof Error ? reason.message : 'Could not load administration data.')) }, [session.token])
-  const decide = async (id: number, decision: 'approved' | 'rejected' | 'revoked') => { const reason = decision === 'approved' ? '' : window.prompt(`Reason for ${decision}:`) || ''; if (decision !== 'approved' && !reason) return; const response = await authenticatedApiFetch(`/api/admin/pharmacies/${id}/decision`, session.token, { method: 'POST', body: JSON.stringify({ decision, reason }) }); if (!response.ok) { const result = await response.json(); setError(result.error || 'Decision failed.'); return }; setPending((items) => items.filter((item) => item.id !== id)) }
+  const decide = async (id: number, decision: 'approved' | 'rejected' | 'revoked') => { const reason = decision === 'approved' ? '' : window.prompt(`Reason for ${decision}:`) || ''; if (decision !== 'approved' && !reason) return; const response = await authenticatedApiFetch(`/api/admin/pharmacies/${id}/decision`, session.token, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ decision, reason }) }); if (!response.ok) { const result = await response.json(); setError(result.error || 'Decision failed.'); return }; setPending((items) => items.filter((item) => item.id !== id)) }
   return <main className="admin-page"><header className="admin-header"><div><div className="brand-mark">P+</div><h1>Administration</h1><p>Platform-wide pharmacy operations</p></div><button className="quiet-action" onClick={onSignOut}><LogOut className="icon" /> Sign out</button></header>{error && <p className="auth-error">{error}</p>}{!data ? <p>Loading dashboard…</p> : <><section className="admin-stats"><article><span>Customers</span><strong>{data.accounts.customer || 0}</strong></article><article><span>Pharmacy owners</span><strong>{data.accounts.pharmacy_owner || 0}</strong></article><article><span>Pharmacies</span><strong>{data.pharmacies}</strong></article><article><span>Delivered revenue</span><strong>₹{data.revenue.toFixed(2)}</strong></article></section><section className="admin-review-panel"><h2>Pharmacy applications</h2>{pending.length ? pending.map((item) => <article className="admin-application" key={item.id}><div><h3>{item.name}</h3><p>{item.city || 'Location pending'} · status: <strong>{item.approvalStatus}</strong></p><p>Registration: {item.registrationNumber || '—'} · License: {item.licenseNumber || item.drugLicenseNumber || '—'}</p><p>Authorized pharmacist: {item.authorizedPharmacistName || '—'} ({item.authorizedPharmacistRegistration || '—'})</p>{item.evidenceUrl && <a href={item.evidenceUrl} target="_blank" rel="noreferrer">Open evidence link</a>}{item.rejectionReason && <p className="owner-form-error">Reason: {item.rejectionReason}</p>}</div><div className="admin-application-actions"><button className="primary-cta dark" onClick={() => void decide(item.id, 'approved')}>Approve</button><button className="quiet-action danger-action" onClick={() => void decide(item.id, 'rejected')}>Reject</button><button className="quiet-action" onClick={() => void decide(item.id, 'revoked')}>Revoke</button></div></article>) : <p>No pending pharmacy applications.</p>}</section><section className="admin-grid"><article><h2>Low-stock inventory</h2>{data.lowStock.length ? data.lowStock.map((item) => <p key={item.id}><strong>{item.name}</strong> — {item.stock}/{item.reorderLevel} · {item.pharmacyName}</p>) : <p>All active inventory is above its reorder level.</p>}</article><article><h2>Recent orders</h2>{data.recentOrders.map((order) => <p key={order.id}><strong>{order.orderNumber}</strong> — {order.status} · ₹{order.total.toFixed(2)}</p>)}</article></section></>}</main>
 }
 
@@ -4212,8 +4434,8 @@ function DashboardPage({
           {activeSection === 'home' && (
             <PharmacyOverviewScreen
               session={ownerSession}
-              onOpenInventory={() => navigate('/dashboard/medicines')}
-              onOpenOrders={() => navigate('/dashboard/orders')}
+              onOpenInventory={(filter) => navigate(`/dashboard/medicines${filter ? `?${filter}` : ''}`)}
+              onOpenOrders={(filter) => navigate(`/dashboard/orders${filter ? `?${filter}` : ''}`)}
               onOpenOrder={(id) => navigate(`/dashboard/orders/${id}`)}
             />
           )}
@@ -4429,6 +4651,44 @@ function PharmacyVerificationScreen({ token }: { token: string }) {
   return <section className="verification-panel"><div className="pharmacy-page-heading"><div><h3>Submit pharmacy verification</h3><p>Provide registration and pharmacist evidence. Marketplace access stays disabled until approval. Prescription review is available only when this owner account name exactly matches the approved authorized pharmacist name.</p></div></div>{message && <p className="verification-success">{message}</p>}{error && <p className="owner-form-error">{error}</p>}<form className="verification-form" onSubmit={submit}>{[['registrationNumber','Pharmacy registration number'],['licenseNumber','Drug license number'],['authorizedPharmacistName','Authorized pharmacist name'],['authorizedPharmacistRegistration','Pharmacist registration number'],['evidenceUrl','Evidence link (secure document URL)']].map(([key,label]) => <label key={key}>{label}<input required value={form[key as keyof typeof form]} onChange={(event) => setForm({ ...form, [key]: event.target.value })} placeholder={label} /></label>)}<button className="primary-cta dark" type="submit">Submit for admin review <ArrowUpRight className="icon" /></button></form></section>
 }
 
+type OwnerDashboardData = {
+  kpis: {
+    activeMedicines: number
+    sellableUnits: number
+    lowStock: number
+    outOfStock: number
+    pendingOrders: number
+    batches7Days: number
+    units7Days: number
+    batches30Days: number
+    units30Days: number
+    batches90Days: number
+    units90Days: number
+    purchaseCostAtRisk7Days: number
+    purchaseCostAtRisk30Days: number
+    purchaseCostAtRisk90Days: number
+  }
+  sales: OwnerSalesPoint[]
+  recentStockMovements: StockMovement[]
+  recentOrderEvents: Array<{ id: number; orderId: number; orderNumber: string; status: string; actorName: string; createdAt: string; note: string | null }>
+}
+
+type OwnerDashboardAlerts = {
+  lowStock: Array<{ medicineId: number; name: string; reorderLevel: number; sellableStock: number }>
+  outOfStock: Array<{ medicineId: number; name: string; reorderLevel: number; sellableStock: number }>
+  expiringBatches: Array<{
+    medicineId: number
+    medicineName: string
+    batchId: number
+    batchNumber: string
+    expiryDate: string
+    daysUntilExpiry: number
+    sellableQuantity: number
+    purchasePrice: number
+    purchaseCostAtRisk: number
+  }>
+}
+
 function PharmacyOverviewScreen({
   session,
   onOpenInventory,
@@ -4436,66 +4696,59 @@ function PharmacyOverviewScreen({
   onOpenOrder,
 }: {
   session: OwnerSession
-  onOpenInventory: () => void
-  onOpenOrders: () => void
+  onOpenInventory: (filter?: string) => void
+  onOpenOrders: (filter?: string) => void
   onOpenOrder: (id: number) => void
 }) {
-  const [inventory, setInventory] = useState<InventoryRecord[]>([])
-  const [movements, setMovements] = useState<StockMovement[]>([])
-  const [orders, setOrders] = useState<CustomerOrder[]>([])
+  const [range, setRange] = useState<'today' | 'week' | 'month'>('week')
+  const [dashboard, setDashboard] = useState<OwnerDashboardData | null>(null)
+  const [alerts, setAlerts] = useState<OwnerDashboardAlerts | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-  const [now] = useState(() => Date.now())
 
   useEffect(() => {
     let cancelled = false
-    const loadInventory = async () => {
+    const loadDashboard = async () => {
+      setLoading(true)
+      setError('')
       try {
-        const [inventoryResponse, movementResponse, ordersResponse] = await Promise.all([
-          ownerApiFetch('/api/medicines', session.token),
-          ownerApiFetch('/api/owner/stock-movements', session.token),
-          ownerApiFetch('/api/owner/orders', session.token),
+        const [dashboardResponse, alertsResponse] = await Promise.all([
+          ownerApiFetch(`/api/owner/dashboard?range=${range}`, session.token),
+          ownerApiFetch('/api/owner/alerts', session.token),
         ])
-        const [inventoryResult, movementResult, ordersResult] = await Promise.all([inventoryResponse.json(), movementResponse.json(), ordersResponse.json()])
-        if (!inventoryResponse.ok) throw new Error(inventoryResult.error || 'Could not load your inventory.')
-        if (!movementResponse.ok) throw new Error(movementResult.error || 'Could not load stock movement history.')
-        if (!ordersResponse.ok) throw new Error(ordersResult.error || 'Could not load recent pharmacy orders.')
+        const [dashboardResult, alertsResult] = await Promise.all([dashboardResponse.json(), alertsResponse.json()])
+        if (!dashboardResponse.ok) throw new Error(dashboardResult.error || 'Could not load your dashboard.')
+        if (!alertsResponse.ok) throw new Error(alertsResult.error || 'Could not load inventory alerts.')
         if (!cancelled) {
-          setInventory(inventoryResult as InventoryRecord[])
-          setMovements(movementResult)
-          setOrders(ordersResult as CustomerOrder[])
+          setDashboard(dashboardResult as OwnerDashboardData)
+          setAlerts(alertsResult as OwnerDashboardAlerts)
         }
       } catch (requestError) {
-        if (!cancelled) setError(requestError instanceof Error ? requestError.message : 'Could not load your inventory.')
+        if (!cancelled) setError(requestError instanceof Error ? requestError.message : 'Could not load your dashboard.')
       } finally {
         if (!cancelled) setLoading(false)
       }
     }
-    // Load only inventory owned by the authenticated pharmacy.
     // oxlint-disable-next-line react/set-state-in-effect
-    void loadInventory()
+    void loadDashboard()
     return () => {
       cancelled = true
     }
-  }, [session.token])
+  }, [session.token, range])
 
-  const lowStock = inventory
-    .filter((item) => item.stock <= item.reorderLevel)
-    .sort((left, right) => left.stock - right.stock)
-    .slice(0, 4)
-  const expiringSoon = inventory.filter((item) => {
-    if (!item.expiry) return false
-    const expiresAt = new Date(`${item.expiry.slice(0, 10)}T00:00:00`)
-    const daysRemaining = (expiresAt.getTime() - now) / 86400000
-    return daysRemaining >= 0 && daysRemaining <= 30
-  })
+  const kpis = dashboard?.kpis
+  const expiringWithin = (days: number) => alerts?.expiringBatches.filter((batch) =>
+    batch.daysUntilExpiry >= 0 && batch.daysUntilExpiry <= days) ?? []
+  const lowStock = alerts?.lowStock.slice(0, 4) ?? []
+  const recentMovementSummaries = summarizeRecentStockMovements(dashboard?.recentStockMovements ?? [])
+  const grossSalesTotal = dashboard?.sales.reduce((sum, point) => sum + point.grossSales, 0) ?? 0
+  const collectedPaymentsTotal = dashboard?.sales.reduce((sum, point) => sum + point.collectedPayments, 0) ?? 0
   const address = [
     session.user.pharmacyAddress,
     session.user.pharmacyCity,
     session.user.pharmacyState,
     session.user.pharmacyPostalCode,
   ].filter(Boolean).join(', ')
-  const recentMovementSummaries = summarizeRecentStockMovements(movements)
 
   return (
     <section className="pharmacy-overview">
@@ -4504,7 +4757,7 @@ function PharmacyOverviewScreen({
           <span className="eyebrow">YOUR PHARMACY</span>
           <h3>{session.user.pharmacyName}</h3>
           <p>Welcome, {session.user.fullName}. This workspace and inventory belong to your pharmacy.</p>
-          <button className="accept-action" onClick={onOpenInventory}><Pill className="icon" /> Manage medicines</button>
+          <button className="accept-action" onClick={() => onOpenInventory()}><Pill className="icon" /> Manage medicines</button>
         </div>
         <div className="pharmacy-welcome-mark"><span>P+</span></div>
       </article>
@@ -4516,65 +4769,112 @@ function PharmacyOverviewScreen({
       </div>
 
       <div className="inventory-overview-grid">
-        <article className="inventory-overview-card">
+        <button type="button" className="inventory-overview-card" onClick={() => onOpenInventory()}>
           <span className="inventory-overview-icon"><Pill className="icon" /></span>
           <span>Active products</span>
-          <strong>{loading ? '—' : inventory.length}</strong>
-        </article>
-        <article className="inventory-overview-card">
+          <strong>{loading ? '—' : kpis?.activeMedicines ?? 0}</strong>
+        </button>
+        <button type="button" className="inventory-overview-card" onClick={() => onOpenInventory('filter=low-stock')}>
           <span className="inventory-overview-icon warning"><BadgeAlert className="icon" /></span>
           <span>Low stock</span>
-          <strong>{loading ? '—' : inventory.filter((item) => item.stock > 0 && item.stock <= item.reorderLevel).length}</strong>
-        </article>
-        <article className="inventory-overview-card">
+          <strong>{loading ? '—' : kpis?.lowStock ?? 0}</strong>
+        </button>
+        <button type="button" className="inventory-overview-card" onClick={() => onOpenInventory('filter=out-of-stock')}>
           <span className="inventory-overview-icon danger"><Package className="icon" /></span>
           <span>Out of stock</span>
-          <strong>{loading ? '—' : inventory.filter((item) => item.stock === 0).length}</strong>
-        </article>
-        <article className="inventory-overview-card">
+          <strong>{loading ? '—' : kpis?.outOfStock ?? 0}</strong>
+        </button>
+        <button type="button" className="inventory-overview-card" onClick={() => onOpenInventory()}>
           <span className="inventory-overview-icon"><PackageCheck className="icon" /></span>
-          <span>Units on hand</span>
-          <strong>{loading ? '—' : inventory.reduce((sum, item) => sum + item.stock, 0).toLocaleString('en-IN')}</strong>
-        </article>
-        <article className="inventory-overview-card">
+          <span>Sellable units</span>
+          <strong>{loading ? '—' : (kpis?.sellableUnits ?? 0).toLocaleString('en-IN')}</strong>
+        </button>
+        <button type="button" className="inventory-overview-card" onClick={() => onOpenOrders('status=pending')}>
+          <span className="inventory-overview-icon"><ShoppingBag className="icon" /></span>
+          <span>Pending orders</span>
+          <strong>{loading ? '—' : kpis?.pendingOrders ?? 0}</strong>
+        </button>
+        <button type="button" className="inventory-overview-card expiry-risk" onClick={() => onOpenInventory('filter=expiring&days=7')}>
           <span className="inventory-overview-icon warning"><CalendarDays className="icon" /></span>
-          <span>Expiring in 30 days</span>
-          <strong>{loading ? '—' : expiringSoon.length}</strong>
-        </article>
+          <span>Expiring batches · 7 days</span>
+          <strong>{loading ? '—' : `${kpis?.batches7Days ?? 0} / ${kpis?.units7Days ?? 0} units`}</strong>
+          <small>{loading ? '—' : `₹${(kpis?.purchaseCostAtRisk7Days ?? 0).toLocaleString('en-IN', { maximumFractionDigits: 2 })} purchase cost at risk`}</small>
+        </button>
+        <button type="button" className="inventory-overview-card expiry-risk" onClick={() => onOpenInventory('filter=expiring&days=30')}>
+          <span className="inventory-overview-icon warning"><CalendarDays className="icon" /></span>
+          <span>Expiring batches · 30 days</span>
+          <strong>{loading ? '—' : `${kpis?.batches30Days ?? 0} / ${kpis?.units30Days ?? 0} units`}</strong>
+          <small>{loading ? '—' : `₹${(kpis?.purchaseCostAtRisk30Days ?? 0).toLocaleString('en-IN', { maximumFractionDigits: 2 })} purchase cost at risk`}</small>
+        </button>
+        <button type="button" className="inventory-overview-card expiry-risk" onClick={() => onOpenInventory('filter=expiring&days=90')}>
+          <span className="inventory-overview-icon warning"><CalendarDays className="icon" /></span>
+          <span>Expiring batches · 90 days</span>
+          <strong>{loading ? '—' : `${kpis?.batches90Days ?? 0} / ${kpis?.units90Days ?? 0} units`}</strong>
+          <small>{loading ? '—' : `₹${(kpis?.purchaseCostAtRisk90Days ?? 0).toLocaleString('en-IN', { maximumFractionDigits: 2 })} purchase cost at risk`}</small>
+        </button>
       </div>
+
+      {error && <p className="owner-form-error" role="alert">{error}</p>}
+      <section className="owner-sales-panel">
+        <div className="sales-panel-header">
+          <div><h3>Sales performance</h3><p>Gross order value excludes cancelled and declined orders. Collected totals include only payments marked paid.</p></div>
+          <div className="sales-range-tabs" role="group" aria-label="Sales trend range">
+            {(['today', 'week', 'month'] as const).map((value) => (
+              <button type="button" key={value} className={range === value ? 'active' : ''} aria-pressed={range === value} onClick={() => setRange(value)}>
+                {value === 'today' ? 'Today' : value === 'week' ? 'Week' : 'Month'}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="sales-trend-summary">
+          <div className="sales-metric gross-metric"><span>Gross order value</span><strong>₹{grossSalesTotal.toLocaleString('en-IN')}</strong><small>Includes unpaid orders</small></div>
+          <div className="sales-metric collected-metric"><span>Collected payments</span><strong>₹{collectedPaymentsTotal.toLocaleString('en-IN')}</strong><small>Confirmed as paid</small></div>
+        </div>
+        {loading ? <p className="inventory-note">Loading sales trends…</p> : (
+          <div className="sales-trend-chart" role="img" aria-label={`${range} chart comparing gross order value and collected payments`}>
+            <Suspense fallback={<p className="inventory-note">Loading chart…</p>}>
+              <OwnerSalesChart data={dashboard?.sales ?? []} range={range} />
+            </Suspense>
+          </div>
+        )}
+        <div className="sales-trend-legend"><span><i className="gross-bar" /> Gross order value</span><span><i className="collected-bar" /> Collected payments</span></div>
+        <p className="sales-payment-note">A UPI QR scan does not confirm payment; collections appear after a payment is recorded as paid.</p>
+      </section>
 
       <div className="owner-tracking-grid">
       <section className="pharmacy-low-stock">
         <div className="pharmacy-page-heading">
-          <div><h3>Inventory attention</h3><p>Stock status from your saved medicine records.</p></div>
-          <button className="text-action" onClick={onOpenInventory}>View inventory</button>
+          <div><h3>Inventory attention</h3><p>Sellable stock from batches and medicine reorder thresholds.</p></div>
+          <button className="text-action" onClick={() => onOpenInventory('filter=low-stock')}>View low stock</button>
         </div>
-        {error && <p className="owner-form-error" role="alert">{error}</p>}
         {loading ? <p className="inventory-note">Loading your inventory…</p> : lowStock.length ? (
           <div className="low-stock-list">
             {lowStock.map((item) => (
-              <div className="low-stock-row" key={item.id}>
+              <button type="button" className="low-stock-row" key={item.medicineId} onClick={() => onOpenInventory(item.sellableStock === 0 ? 'filter=out-of-stock' : 'filter=low-stock')}>
                 <span className="low-stock-pip"><Pill className="icon" /></span>
-                <div><strong>{item.name}</strong><small>{item.category} · alert at {item.reorderLevel}</small></div>
-                <span className={item.stock === 0 ? 'danger-tag' : 'warning-tag'}>
-                  {item.stock === 0 ? 'Out of stock' : `${item.stock} left`}
+                <div><strong>{item.name}</strong><small>Reorder alert at {item.reorderLevel}</small></div>
+                <span className={item.sellableStock === 0 ? 'danger-tag' : 'warning-tag'}>
+                  {item.sellableStock === 0 ? 'Out of stock' : `${item.sellableStock} left`}
                 </span>
-              </div>
+              </button>
             ))}
           </div>
         ) : (
           <div className="empty-state-card compact-empty">No low-stock medicines in your inventory.</div>
         )}
         <div className="expiry-attention">
-          <h4>Expiring soon</h4>
-          {expiringSoon.length ? expiringSoon.slice(0, 5).map((item) => (
-            <div className="expiry-attention-row" key={item.id}><strong>{item.name}</strong><span>{new Date(`${item.expiry!.slice(0, 10)}T00:00:00`).toLocaleDateString()}</span></div>
-          )) : <p>No medicines expire in the next 30 days.</p>}
+          <h4>Expiring within 30 days</h4>
+          {expiringWithin(30).length ? expiringWithin(30).slice(0, 5).map((batch) => (
+            <button type="button" className="expiry-attention-row" key={`${batch.medicineId}-${batch.batchNumber}`} onClick={() => onOpenInventory('filter=expiring&days=30')}>
+              <strong>{batch.medicineName} · {batch.batchNumber}</strong>
+              <span>{batch.sellableQuantity} sellable · {new Date(`${batch.expiryDate.slice(0, 10)}T00:00:00`).toLocaleDateString()} · ₹{batch.purchaseCostAtRisk.toLocaleString('en-IN', { maximumFractionDigits: 2 })} at risk</span>
+            </button>
+          )) : <p>No batches expire in the next 30 days.</p>}
         </div>
       </section>
       <section className="stock-movement-panel">
         <div className="pharmacy-page-heading"><div><h3>Recent stock activity</h3><p>Stock is deducted when orders are placed; quick manual edits are grouped.</p></div></div>
-        {loading ? <p className="inventory-note">Loading movement history…</p> : movements.length ? (
+        {loading ? <p className="inventory-note">Loading movement history…</p> : dashboard?.recentStockMovements.length ? (
           <div className="stock-movement-list">{recentMovementSummaries.slice(0, 6).map((movement) => (
             <article key={movement.id}>
               <span className={movement.quantityChange < 0 ? 'stock-movement-icon decrease' : 'stock-movement-icon'}>{movement.quantityChange < 0 ? <Minus className="icon" /> : <Plus className="icon" />}</span>
@@ -4595,24 +4895,171 @@ function PharmacyOverviewScreen({
         ) : <div className="empty-state-card compact-empty">Stock changes will be tracked here.</div>}
       </section>
       <section className="owner-recent-orders">
-        <div className="pharmacy-page-heading"><div><h3>Recent order activity</h3><p>Customer orders and current fulfillment status.</p></div><button type="button" className="text-action" onClick={onOpenOrders}>View all</button></div>
-        {loading ? <p className="inventory-note">Loading recent orders…</p> : orders.length ? (
-          <div className="owner-recent-order-list">{orders.slice(0, 4).map((order) => (
-            <button type="button" key={order.id} onClick={() => onOpenOrder(order.id)}>
+        <div className="pharmacy-page-heading"><div><h3>Recent order status changes</h3><p>Latest fulfillment events for your pharmacy’s orders.</p></div><button type="button" className="text-action" onClick={() => onOpenOrders()}>View orders</button></div>
+        {loading ? <p className="inventory-note">Loading order activity…</p> : dashboard?.recentOrderEvents.length ? (
+          <div className="owner-recent-order-list">{dashboard.recentOrderEvents.slice(0, 8).map((event) => (
+            <button type="button" key={event.id} onClick={() => onOpenOrder(event.orderId)}>
               <span className="owner-recent-order-icon"><ShoppingBag className="icon" /></span>
-              <span><strong>{order.orderNumber}</strong><small>{order.status === 'accepted' ? 'Accepted' : orderStatusLabel[order.status] ?? order.status} · {order.items.length} items</small></span>
-              <strong>₹{order.total.toLocaleString('en-IN')}</strong>
+              <span><strong>{event.orderNumber}</strong><small>{orderStatusLabel[event.status] ?? event.status} · {event.actorName} · {new Date(event.createdAt).toLocaleString('en-IN')}</small></span>
+              <strong>Open</strong>
             </button>
           ))}</div>
-        ) : <div className="empty-state-card compact-empty">New customer orders will appear here.</div>}
+        ) : <div className="empty-state-card compact-empty">Order status changes will appear here.</div>}
       </section>
       </div>
     </section>
   )
 }
 
+function OwnerReturnReviewCard({
+  request,
+  token,
+  onUpdated,
+}: {
+  request: CustomerReturnRequest
+  token: string
+  onUpdated: (order: CustomerOrder) => void
+}) {
+  const [reason, setReason] = useState('')
+  const [items, setItems] = useState(() => Object.fromEntries(request.items.map((item) => [item.id, {
+    receivedQuantity: '0',
+    disposition: 'quarantine',
+    restockSellable: false,
+    lawfulRestockConfirmed: false,
+  }])))
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
+
+  const decide = async (decision: 'approved' | 'rejected') => {
+    setSaving(true)
+    setError('')
+    try {
+      const response = await ownerApiFetch(`/api/owner/returns/${request.id}/decision`, token, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          decision,
+          reason: reason.trim(),
+          ...(decision === 'approved' ? {
+            items: request.items.map((item) => ({
+              returnItemId: item.id,
+              receivedQuantity: Number(items[item.id]?.receivedQuantity ?? 0),
+              disposition: items[item.id]?.disposition ?? 'quarantine',
+              restockSellable: items[item.id]?.restockSellable ?? false,
+              lawfulRestockConfirmed: items[item.id]?.lawfulRestockConfirmed ?? false,
+            })),
+          } : {}),
+        }),
+      })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.error || 'Could not save this return decision.')
+      onUpdated(result as CustomerOrder)
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Could not save this return decision.')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <article className="owner-return-review">
+      <header><strong>Return request #{request.id}</strong><span>Requested {new Date(request.createdAt).toLocaleString('en-IN')}</span></header>
+      <p>Customer reason: {request.reason}</p>
+      {request.items.map((item) => {
+        const values = items[item.id]
+        const canInspectForRestock = values?.disposition === 'inspected' &&
+          Number(values.receivedQuantity) > 0 &&
+          !item.prescriptionRequired
+        return (
+          <div className="owner-return-item" key={item.id}>
+            <strong>{item.name} · requested {item.requestedQuantity}</strong>
+            <label>
+              Received quantity
+              <input
+                type="number"
+                min="0"
+                max={item.requestedQuantity}
+                step="1"
+                value={values?.receivedQuantity ?? '0'}
+                onChange={(event) => setItems((current) => ({
+                  ...current,
+                  [item.id]: { ...current[item.id], receivedQuantity: event.target.value },
+                }))}
+              />
+            </label>
+            <label>
+              Disposition
+              <select
+                value={values?.disposition ?? 'quarantine'}
+                onChange={(event) => setItems((current) => ({
+                  ...current,
+                  [item.id]: {
+                    ...current[item.id],
+                    disposition: event.target.value,
+                    restockSellable: false,
+                    lawfulRestockConfirmed: false,
+                  },
+                }))}
+              >
+                <option value="quarantine">Quarantine (non-sellable)</option>
+                <option value="damaged">Damaged (non-sellable)</option>
+                <option value="non_returnable">Non-returnable (non-sellable)</option>
+                <option value="inspected">Inspected</option>
+              </select>
+            </label>
+            {canInspectForRestock && (
+              <div className="owner-return-attestation">
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={values?.restockSellable ?? false}
+                    onChange={(event) => setItems((current) => ({
+                      ...current,
+                      [item.id]: {
+                        ...current[item.id],
+                        restockSellable: event.target.checked,
+                        lawfulRestockConfirmed: event.target.checked ? current[item.id]?.lawfulRestockConfirmed ?? false : false,
+                      },
+                    }))}
+                  />
+                  Add inspected units back to sellable stock
+                </label>
+                {values?.restockSellable && (
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={values.lawfulRestockConfirmed}
+                      onChange={(event) => setItems((current) => ({
+                        ...current,
+                        [item.id]: { ...current[item.id], lawfulRestockConfirmed: event.target.checked },
+                      }))}
+                    />
+                    I confirm this restock is permitted by applicable policy
+                  </label>
+                )}
+              </div>
+            )}
+            {item.prescriptionRequired && <small>Prescription medicines cannot be restored to sellable stock.</small>}
+          </div>
+        )
+      })}
+      <p className="return-safety-note">Received goods stay non-sellable by default. Sellable restock is limited to inspected, non-prescription, unexpired original batches and requires an explicit policy attestation.</p>
+      <label>
+        Decision reason
+        <textarea required minLength={3} maxLength={1000} rows={2} value={reason} onChange={(event) => setReason(event.target.value)} />
+      </label>
+      <div className="owner-order-actions">
+        <button type="button" className="decline-action" disabled={saving || reason.trim().length < 3} onClick={() => void decide('rejected')}>Reject request</button>
+        <button type="button" className="accept-action" disabled={saving || reason.trim().length < 3} onClick={() => void decide('approved')}>{saving ? 'Saving…' : 'Approve received items'}</button>
+      </div>
+      {error && <p className="owner-form-error" role="alert">{error}</p>}
+    </article>
+  )
+}
+
 function PharmacyOrdersScreen({ token, orderId }: { token: string; orderId?: string }) {
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
   const deliveryCodeInputs = useRef<Record<number, Array<HTMLInputElement | null>>>({})
   const [orders, setOrders] = useState<CustomerOrder[]>([])
   const [otpInputs, setOtpInputs] = useState<Record<number, string>>({})
@@ -4621,7 +5068,12 @@ function PharmacyOrdersScreen({ token, orderId }: { token: string; orderId?: str
   const [savingId, setSavingId] = useState<number | null>(null)
   const [error, setError] = useState('')
   const [search, setSearch] = useState('')
-  const [statusFilter, setStatusFilter] = useState('all')
+  const [statusFilter, setStatusFilter] = useState(() => {
+    const requestedStatus = searchParams.get('status')
+    return requestedStatus && ['pending', 'accepted', 'preparing', 'ready', 'out_for_delivery', 'delivered'].includes(requestedStatus)
+      ? requestedStatus
+      : 'all'
+  })
 
   const loadOrders = useCallback(async () => {
     try {
@@ -4725,9 +5177,27 @@ function PharmacyOrdersScreen({ token, orderId }: { token: string; orderId?: str
             <div className="owner-order-items">{order.items.map((item) => <div key={`${order.id}-${item.medicineId}`}><span>{item.name} × {formatOrderItemQuantity(item)}{item.prescriptionRequired && <small> · Prescription #{item.prescriptionId} approved</small>}</span><strong>₹{item.lineTotal.toLocaleString('en-IN')}</strong></div>)}</div>
             <p className="customer-order-address"><MapPin className="icon" /> {order.fulfillmentMethod === 'pickup' ? 'Pharmacy pickup' : formatOrderLocation(order)}</p>
             <OrderTimeline order={order} />
+            {(order.returnRequests ?? []).filter((request) => request.type === 'return').map((request) => (
+              request.status === 'requested' ? (
+                <OwnerReturnReviewCard
+                  key={request.id}
+                  request={request}
+                  token={token}
+                  onUpdated={(updatedOrder) => setOrders((current) =>
+                    current.map((entry) => entry.id === updatedOrder.id ? updatedOrder : entry),
+                  )}
+                />
+              ) : (
+                <div className="order-return-status" key={request.id}>
+                  <strong>Return #{request.id} · {request.status}</strong>
+                  {request.decisionReason && <small>{request.decisionReason}</small>}
+                  {request.refundStatus === 'pending_reconciliation' && <small>Refund ₹{request.refundAmount.toLocaleString('en-IN')} is awaiting provider reconciliation.</small>}
+                </div>
+              )
+            ))}
             {['pending', 'accepted', 'preparing', 'ready', 'out_for_delivery'].includes(order.status) && (
               <label className="owner-transition-note">
-                {order.status === 'pending' ? 'Decline reason (required to decline)' : 'Optional update for the customer'}
+                {order.status === 'pending' ? 'Decline reason (at least 3 characters)' : 'Optional update for the customer'}
                 <textarea
                   maxLength={500}
                   rows={2}
@@ -4736,7 +5206,7 @@ function PharmacyOrdersScreen({ token, orderId }: { token: string; orderId?: str
                 />
               </label>
             )}
-            {order.status === 'pending' && <div className="owner-order-actions"><button type="button" className="decline-action" disabled={savingId === order.id || !(transitionNotes[order.id] ?? '').trim()} onClick={() => void updateStatus(order, 'declined')}>Decline</button><button type="button" className="accept-action" disabled={savingId === order.id} onClick={() => void updateStatus(order, 'accepted')}>{savingId === order.id ? 'Saving…' : 'Accept order'}</button></div>}
+            {order.status === 'pending' && <div className="owner-order-actions"><button type="button" className="decline-action" disabled={savingId === order.id || (transitionNotes[order.id] ?? '').trim().length < 3} onClick={() => void updateStatus(order, 'declined')}>Decline</button><button type="button" className="accept-action" disabled={savingId === order.id} onClick={() => void updateStatus(order, 'accepted')}>{savingId === order.id ? 'Saving…' : 'Accept order'}</button></div>}
             {order.status === 'accepted' && <button type="button" className="accept-action owner-order-primary" disabled={savingId === order.id} onClick={() => void updateStatus(order, 'preparing')}>{savingId === order.id ? 'Saving…' : 'Start preparation'}</button>}
             {order.status === 'preparing' && <button type="button" className="accept-action owner-order-primary" disabled={savingId === order.id} onClick={() => void updateStatus(order, 'ready')}>{savingId === order.id ? 'Saving…' : 'Mark ready for dispatch'}</button>}
             {order.status === 'ready' && <button type="button" className="accept-action owner-order-primary" disabled={savingId === order.id} onClick={() => void updateStatus(order, 'out_for_delivery')}>{savingId === order.id ? 'Saving…' : 'Start delivery'}</button>}
@@ -4987,10 +5457,33 @@ function PrescriptionReviewCard({
 }
 
 function PharmacyMedicinesScreen({ onCatalogChange, token }: { onCatalogChange: () => void; token: string }) {
+  const [searchParams, setSearchParams] = useSearchParams()
+  const inventoryFilter = searchParams.get('filter')
   const [inventory, setInventory] = useState<InventoryRecord[]>([])
   const [movements, setMovements] = useState<StockMovement[]>([])
+  const [alertMedicineFilter, setAlertMedicineFilter] = useState<{ key: string; ids: number[] } | null>(null)
   const [form, setForm] = useState<MedicineForm | null>(null)
   const [selectedImage, setSelectedImage] = useState<{ file: File; previewUrl: string } | null>(null)
+  const [receiptMedicine, setReceiptMedicine] = useState<InventoryRecord | null>(null)
+  const [receiptForm, setReceiptForm] = useState<StockReceiptForm>({
+    supplierName: '',
+    batchNumber: '',
+    quantityReceived: '',
+    purchasePrice: '',
+    expiryDate: '',
+  })
+  const [receiptError, setReceiptError] = useState('')
+  const [receiptSaving, setReceiptSaving] = useState(false)
+  const [batchRecords, setBatchRecords] = useState<Record<number, InventoryBatch[]>>({})
+  const [expandedBatchMedicineId, setExpandedBatchMedicineId] = useState<number | null>(null)
+  const [batchLoadingMedicineId, setBatchLoadingMedicineId] = useState<number | null>(null)
+  const [batchLoadError, setBatchLoadError] = useState<{ medicineId: number; message: string } | null>(null)
+  const [countMedicine, setCountMedicine] = useState<InventoryRecord | null>(null)
+  const [countLines, setCountLines] = useState<InventoryCountLine[]>([])
+  const [countReason, setCountReason] = useState('')
+  const [countError, setCountError] = useState('')
+  const [countSaving, setCountSaving] = useState(false)
+  const [inventoryAuditNotice, setInventoryAuditNotice] = useState('')
   const [editingId, setEditingId] = useState<number | null>(null)
   const [stepError, setStepError] = useState('')
   const [inventorySearch, setInventorySearch] = useState('')
@@ -5009,7 +5502,7 @@ function PharmacyMedicinesScreen({ onCatalogChange, token }: { onCatalogChange: 
   const loadInventory = useCallback(async () => {
     try {
       const [response, movementsResponse] = await Promise.all([
-        ownerApiFetch('/api/medicines', token),
+        ownerApiFetch('/api/owner/medicines', token),
         ownerApiFetch('/api/owner/stock-movements', token),
       ])
       const [result, movementResult] = await Promise.all([response.json(), movementsResponse.json()])
@@ -5030,6 +5523,45 @@ function PharmacyMedicinesScreen({ onCatalogChange, token }: { onCatalogChange: 
     // oxlint-disable-next-line react/set-state-in-effect
     void loadInventory()
   }, [loadInventory])
+
+  useEffect(() => {
+    let cancelled = false
+    const filter = inventoryFilter
+    if (!['low-stock', 'out-of-stock', 'expiring'].includes(filter ?? '')) return
+    const filterKey = `${filter}:${searchParams.get('days') ?? ''}`
+
+    const loadAlertMedicineIds = async () => {
+      try {
+        const response = await ownerApiFetch('/api/owner/alerts', token)
+        const result = await response.json() as OwnerDashboardAlerts & { error?: string }
+        if (!response.ok) throw new Error(result.error || 'Could not load inventory alert filters.')
+        const ids = filter === 'low-stock'
+          ? result.lowStock.map((item) => item.medicineId)
+          : filter === 'out-of-stock'
+            ? result.outOfStock.map((item) => item.medicineId)
+            : result.expiringBatches
+              .filter((batch) => {
+                const days = Number(searchParams.get('days'))
+                const withinDays = [7, 30, 90].includes(days) ? days : 7
+                return batch.daysUntilExpiry >= 0 && batch.daysUntilExpiry <= withinDays
+              })
+              .map((batch) => batch.medicineId)
+        if (!cancelled) {
+          setAlertMedicineFilter({ key: filterKey, ids: [...new Set(ids)] })
+          setError('')
+        }
+      } catch (requestError) {
+        if (!cancelled) {
+          setAlertMedicineFilter({ key: filterKey, ids: [] })
+          setError(requestError instanceof Error ? requestError.message : 'Could not load inventory alert filters.')
+        }
+      }
+    }
+    void loadAlertMedicineIds()
+    return () => {
+      cancelled = true
+    }
+  }, [inventoryFilter, searchParams, token])
 
   const startEdit = (item: InventoryRecord) => {
     setEditingId(item.id)
@@ -5074,6 +5606,167 @@ function PharmacyMedicinesScreen({ onCatalogChange, token }: { onCatalogChange: 
     setStepError('')
   }
 
+  const openStockReceipt = (item: InventoryRecord) => {
+    setReceiptMedicine(item)
+    setReceiptForm({
+      supplierName: '',
+      batchNumber: '',
+      quantityReceived: '',
+      purchasePrice: '',
+      expiryDate: '',
+    })
+    setReceiptError('')
+  }
+
+  const toggleBatchHistory = async (item: InventoryRecord) => {
+    if (expandedBatchMedicineId === item.id) {
+      setExpandedBatchMedicineId(null)
+      return
+    }
+    setExpandedBatchMedicineId(item.id)
+    setBatchLoadError(null)
+    if (batchRecords[item.id]) return
+
+    setBatchLoadingMedicineId(item.id)
+    try {
+      const response = await ownerApiFetch(`/api/owner/medicines/${item.id}/batches`, token)
+      const result = await response.json() as InventoryBatch[] | { error?: string }
+      if (!response.ok || !Array.isArray(result)) {
+        throw new Error('error' in result ? result.error || 'Could not load batch history.' : 'Could not load batch history.')
+      }
+      setBatchRecords((current) => ({ ...current, [item.id]: result }))
+    } catch (requestError) {
+      setBatchLoadError({
+        medicineId: item.id,
+        message: requestError instanceof Error ? requestError.message : 'Could not load batch history.',
+      })
+    } finally {
+      setBatchLoadingMedicineId((current) => current === item.id ? null : current)
+    }
+  }
+
+  const startInventoryCount = (item: InventoryRecord) => {
+    const batches = batchRecords[item.id] ?? []
+    if (!batches.length) {
+      setBatchLoadError({ medicineId: item.id, message: 'Record a supplier receipt before starting a batch count.' })
+      return
+    }
+    setCountMedicine(item)
+    setCountLines(batches.map((batch) => ({
+      batchId: batch.id,
+      batchNumber: batch.batchNumber,
+      expiryDate: batch.expiryDate,
+      isExpired: batch.isExpired,
+      systemQuantity: batch.quantityRemaining,
+      systemSellableQuantity: batch.sellableQuantity,
+      countedQuantity: String(batch.quantityRemaining),
+      countedSellableQuantity: String(batch.sellableQuantity),
+    })))
+    setCountReason('')
+    setCountError('')
+    setInventoryAuditNotice('')
+  }
+
+  const updateCountLine = (
+    batchId: number,
+    field: 'countedQuantity' | 'countedSellableQuantity',
+    value: string,
+  ) => {
+    setCountLines((current) => current.map((line) => {
+      if (line.batchId !== batchId) return line
+      if (field === 'countedQuantity') {
+        const counted = Number(value)
+        const sellable = Math.min(Number(line.countedSellableQuantity), Number.isFinite(counted) ? counted : 0)
+        return {
+          ...line,
+          countedQuantity: value,
+          countedSellableQuantity: line.isExpired ? '0' : String(sellable),
+        }
+      }
+      return { ...line, countedSellableQuantity: line.isExpired ? '0' : value }
+    }))
+  }
+
+  const submitInventoryAudit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (!countMedicine) return
+    setCountSaving(true)
+    setCountError('')
+    try {
+      const response = await ownerApiFetch('/api/owner/inventory-audits', token, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          reason: countReason,
+          items: countLines.map((line) => ({
+            medicineId: countMedicine.id,
+            batchId: line.batchId,
+            countedQuantity: Number(line.countedQuantity),
+            countedSellableQuantity: Number(line.countedSellableQuantity),
+          })),
+        }),
+      })
+      const result = await response.json() as { error?: string; sessionId?: string; authorizer?: string }
+      if (!response.ok || !result.sessionId) throw new Error(result.error || 'Could not save this inventory count.')
+
+      const countedMedicineId = countMedicine.id
+      setCountMedicine(null)
+      setCountLines([])
+      setBatchRecords((current) => {
+        const next = { ...current }
+        delete next[countedMedicineId]
+        return next
+      })
+      setExpandedBatchMedicineId(null)
+      setInventoryAuditNotice(`Count session ${result.sessionId} recorded by ${result.authorizer || 'the signed-in owner'}.`)
+      await loadInventory()
+      onCatalogChange()
+    } catch (requestError) {
+      setCountError(requestError instanceof Error ? requestError.message : 'Could not save this inventory count.')
+    } finally {
+      setCountSaving(false)
+    }
+  }
+
+  const submitStockReceipt = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (!receiptMedicine) return
+    setReceiptSaving(true)
+    setReceiptError('')
+    try {
+      const response = await ownerApiFetch('/api/owner/stock/receipts', token, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          medicineId: receiptMedicine.id,
+          supplierName: receiptForm.supplierName,
+          batchNumber: receiptForm.batchNumber,
+          quantityReceived: Number(receiptForm.quantityReceived),
+          purchasePrice: Number(receiptForm.purchasePrice),
+          expiryDate: receiptForm.expiryDate,
+        }),
+      })
+      const result = await response.json() as { error?: string }
+      if (!response.ok) throw new Error(result.error || 'Could not record this stock receipt.')
+
+      const receivedMedicineId = receiptMedicine.id
+      setReceiptMedicine(null)
+      setReceiptForm({ supplierName: '', batchNumber: '', quantityReceived: '', purchasePrice: '', expiryDate: '' })
+      setBatchRecords((current) => {
+        const next = { ...current }
+        delete next[receivedMedicineId]
+        return next
+      })
+      setExpandedBatchMedicineId(null)
+      await loadInventory()
+      onCatalogChange()
+    } catch (requestError) {
+      setReceiptError(requestError instanceof Error ? requestError.message : 'Could not record this stock receipt.')
+    } finally {
+      setReceiptSaving(false)
+    }
+  }
+
   const saveMedicine = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (!form) return
@@ -5087,10 +5780,38 @@ function PharmacyMedicinesScreen({ onCatalogChange, token }: { onCatalogChange: 
       setStepError('Pack quantity must be a positive whole number.')
       return
     }
-    if ([form.price, form.stock, form.reorderLevel].some((value) =>
-      value.trim() === '' || !Number.isFinite(Number(value)) || Number(value) < 0,
-    )) {
-      setStepError('Enter a valid price, stock quantity, and low-stock alert before saving.')
+    const price = Number(form.price)
+    const stock = Number(form.stock)
+    const reorderLevel = Number(form.reorderLevel)
+    const gstRate = Number(form.gstRate)
+    if (!Number.isFinite(price) || price < 0 || price > 9999999999.99
+      || Math.abs(price * 100 - Math.round(price * 100)) > 0.000001) {
+      setStepError('Enter a non-negative sale price with no more than two decimal places.')
+      return
+    }
+    if (!Number.isSafeInteger(stock) || stock < 0 || !Number.isSafeInteger(reorderLevel) || reorderLevel < 0) {
+      setStepError('Stock and reorder level must be non-negative whole numbers.')
+      return
+    }
+    if (!Number.isFinite(gstRate) || gstRate < 0 || gstRate > 100
+      || Math.abs(gstRate * 100 - Math.round(gstRate * 100)) > 0.000001) {
+      setStepError('GST rate must be between 0 and 100 with no more than two decimal places.')
+      return
+    }
+    if (form.sku.trim() && !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$/.test(form.sku.trim())) {
+      setStepError('SKU must start with a letter or number and contain only letters, numbers, dots, underscores, slashes, or hyphens.')
+      return
+    }
+    if (form.batchNumber.trim() && !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$/.test(form.batchNumber.trim())) {
+      setStepError('Batch number must start with a letter or number and contain only letters, numbers, dots, underscores, slashes, or hyphens.')
+      return
+    }
+    if (form.hsnCode.trim() && !/^(?:\d{4}|\d{6}|\d{8})$/.test(form.hsnCode.trim())) {
+      setStepError('HSN code must contain 4, 6, or 8 digits.')
+      return
+    }
+    if (form.imageUrl.trim() && !isValidOwnerImageUrl(form.imageUrl.trim())) {
+      setStepError('Enter a secure HTTPS image URL or a valid application image path.')
       return
     }
     setSaving(true)
@@ -5109,17 +5830,17 @@ function PharmacyMedicinesScreen({ onCatalogChange, token }: { onCatalogChange: 
         }
         imageUrl = uploadResult.imageUrl
       }
-      const response = await ownerApiFetch(editingId ? `/api/medicines/${editingId}` : '/api/medicines', token, {
-        method: editingId ? 'PUT' : 'POST',
+      const response = await ownerApiFetch(editingId ? `/api/owner/medicines/${editingId}` : '/api/owner/medicines', token, {
+        method: editingId ? 'PATCH' : 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           ...form,
           packQuantity: Number(form.packQuantity),
           imageUrl,
-          price: Number(form.price),
-          stock: Number(form.stock),
-          reorderLevel: Number(form.reorderLevel),
-          gstRate: Number(form.gstRate),
+          price,
+          stock,
+          reorderLevel,
+          gstRate,
           expiry: form.expiry || null,
         }),
       })
@@ -5147,8 +5868,8 @@ function PharmacyMedicinesScreen({ onCatalogChange, token }: { onCatalogChange: 
   const changeStock = async (item: InventoryRecord, amount: number) => {
     const stock = Math.max(0, item.stock + amount)
     try {
-      const response = await ownerApiFetch(`/api/medicines/${item.id}`, token, {
-        method: 'PUT',
+      const response = await ownerApiFetch(`/api/owner/medicines/${item.id}`, token, {
+        method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...item, stock }),
       })
@@ -5167,7 +5888,7 @@ function PharmacyMedicinesScreen({ onCatalogChange, token }: { onCatalogChange: 
   const removeMedicine = async (item: InventoryRecord) => {
     if (!window.confirm(`Archive ${item.name}? It will be removed from active inventory.`)) return
     try {
-      const response = await ownerApiFetch(`/api/medicines/${item.id}`, token, { method: 'DELETE' })
+      const response = await ownerApiFetch(`/api/owner/medicines/${item.id}/deactivate`, token, { method: 'POST' })
       if (!response.ok) {
         const result = await response.json()
         throw new Error(result.error || 'Could not archive medicine.')
@@ -5181,29 +5902,41 @@ function PharmacyMedicinesScreen({ onCatalogChange, token }: { onCatalogChange: 
   }
 
   const inventoryCategories = ['All categories', ...new Set(inventory.map((item) => item.category).sort())]
+  const hasAlertFilter = ['low-stock', 'out-of-stock', 'expiring'].includes(inventoryFilter ?? '')
+  const alertFilterKey = `${inventoryFilter}:${searchParams.get('days') ?? ''}`
+  const alertFilterLoading = hasAlertFilter && alertMedicineFilter?.key !== alertFilterKey
+  const inventoryFilterLabel = inventoryFilter === 'low-stock' ? 'Low-stock medicines'
+    : inventoryFilter === 'out-of-stock' ? 'Out-of-stock medicines'
+      : inventoryFilter === 'expiring' ? `Batches expiring within ${[7, 30, 90].includes(Number(searchParams.get('days'))) ? searchParams.get('days') : 7} days`
+        : ''
   const visibleInventory = inventory.filter((item) => {
     const matchesCategory = inventoryCategory === 'All categories' || item.category === inventoryCategory
     const matchesSearch = !inventorySearch.trim() || `${item.name} ${item.brandName ?? ''} ${item.genericName ?? ''} ${item.strength ?? ''} ${item.dosageForm ?? ''} ${item.sku ?? ''} ${item.batchNumber ?? ''} ${item.manufacturer ?? ''}`.toLowerCase().includes(inventorySearch.trim().toLowerCase())
-    return matchesCategory && matchesSearch
+    const matchesAlert = !hasAlertFilter || (alertMedicineFilter?.key === alertFilterKey && alertMedicineFilter.ids.includes(item.id))
+    return matchesCategory && matchesSearch && matchesAlert
   })
 
   return (
     <section className="pharmacy-page-content">
       <div className="pharmacy-page-heading">
-        <div><h3>Inventory</h3><p>Keep product availability and stock up to date.</p></div>
-        <button
-          className="accept-action"
-          onClick={() => {
-            setEditingId(null)
-            setSelectedImage(null)
-            setStepError('')
-            setForm(emptyMedicineForm())
-          }}
-        >
-          <Plus className="icon" /> Add medicine
-        </button>
+        <div><h3>Inventory</h3><p>{inventoryFilterLabel || 'Keep product availability and stock up to date.'}</p></div>
+        <div className="inventory-heading-actions">
+          {inventoryFilterLabel && <button className="quiet-action" type="button" onClick={() => setSearchParams({})}>Clear filter</button>}
+          <button
+            className="accept-action"
+            onClick={() => {
+              setEditingId(null)
+              setSelectedImage(null)
+              setStepError('')
+              setForm(emptyMedicineForm())
+            }}
+          >
+            <Plus className="icon" /> Add medicine
+          </button>
+        </div>
       </div>
       {error && <p className="owner-form-error" role="alert">{error}</p>}
+      {inventoryAuditNotice && <p className="verification-success" role="status">{inventoryAuditNotice}</p>}
       {form && (
         <div className="medicine-editor-backdrop">
           <section className="medicine-editor" role="dialog" aria-modal="true" aria-labelledby="medicine-editor-title">
@@ -5225,21 +5958,22 @@ function PharmacyMedicinesScreen({ onCatalogChange, token }: { onCatalogChange: 
                 <label>Pack unit<input required placeholder="e.g. tablets, capsules, mL" value={form.packUnit} onChange={(event) => setForm({ ...form, packUnit: event.target.value })} /></label>
                 <label>Category<input required list="medicine-category-options" placeholder="Choose or type a category" value={form.category} onChange={(event) => setForm({ ...form, category: event.target.value })} /><datalist id="medicine-category-options">{categories.map((category) => <option key={category.name} value={category.name} />)}</datalist></label>
                 <label>Pack size<input required placeholder="e.g. 10 tablets" value={form.pack} onChange={(event) => setForm({ ...form, pack: event.target.value })} /></label>
-                <label>Sale price (₹)<input required type="number" min="0" step="0.01" placeholder="0.00" value={form.price} onChange={(event) => setForm({ ...form, price: event.target.value })} /></label>
-                <label>Stock quantity<input required type="number" min="0" step="1" placeholder="0" value={form.stock} onChange={(event) => setForm({ ...form, stock: event.target.value })} /></label>
-                <label>Low-stock alert<input required type="number" min="0" step="1" placeholder="0" value={form.reorderLevel} onChange={(event) => setForm({ ...form, reorderLevel: event.target.value })} /></label>
+                <label>Sale price (₹)<input required type="number" min="0" max="9999999999.99" step="0.01" placeholder="0.00" value={form.price} onChange={(event) => setForm({ ...form, price: event.target.value })} /></label>
+                <label>Stock quantity<input required type="number" min="0" max="2147483647" step="1" placeholder="0" value={form.stock} onChange={(event) => setForm({ ...form, stock: event.target.value })} /></label>
+                <label>Low-stock alert<input required type="number" min="0" max="2147483647" step="1" placeholder="0" value={form.reorderLevel} onChange={(event) => setForm({ ...form, reorderLevel: event.target.value })} /></label>
                 <label>Expiry date<input type="date" value={form.expiry} onChange={(event) => setForm({ ...form, expiry: event.target.value })} /></label>
-                <label>SKU / barcode<input placeholder="Optional" value={form.sku} onChange={(event) => setForm({ ...form, sku: event.target.value })} /></label>
+                <label>SKU / barcode<input maxLength={100} pattern="[A-Za-z0-9][A-Za-z0-9._/-]*" title="Use letters, numbers, dots, underscores, slashes, or hyphens." placeholder="Optional" value={form.sku} onChange={(event) => setForm({ ...form, sku: event.target.value })} /></label>
                 <label>Manufacturer<input placeholder="Optional" value={form.manufacturer} onChange={(event) => setForm({ ...form, manufacturer: event.target.value })} /></label>
-                <label>Batch number<input placeholder="Optional" value={form.batchNumber} onChange={(event) => setForm({ ...form, batchNumber: event.target.value })} /></label>
+                <label>Batch number<input maxLength={100} pattern="[A-Za-z0-9][A-Za-z0-9._/-]*" title="Use letters, numbers, dots, underscores, slashes, or hyphens." placeholder="Optional" value={form.batchNumber} onChange={(event) => setForm({ ...form, batchNumber: event.target.value })} /></label>
                 <label>GST rate (%)<input type="number" min="0" max="100" step="0.01" value={form.gstRate} onChange={(event) => setForm({ ...form, gstRate: event.target.value })} /></label>
-                <label>HSN code<input placeholder="Optional" value={form.hsnCode} onChange={(event) => setForm({ ...form, hsnCode: event.target.value })} /></label>
+                <label>HSN code<input maxLength={8} inputMode="numeric" pattern="(?:[0-9]{4}|[0-9]{6}|[0-9]{8})" title="Enter a 4, 6, or 8 digit HSN code." placeholder="Optional" value={form.hsnCode} onChange={(event) => setForm({ ...form, hsnCode: event.target.value })} /></label>
                 <label className="medicine-field-wide">Product description<textarea rows={3} placeholder="Add helpful details about this product" value={form.description} onChange={(event) => setForm({ ...form, description: event.target.value })} /></label>
                 <div className="medicine-field-wide medicine-image-picker">
                   <div className="medicine-image-picker-heading">
                     <strong>Product photo</strong>
-                    <small>Choose an image from this device. JPEG, PNG, or WebP up to 5 MB.</small>
+                    <small>Use a secure image URL or choose a JPEG, PNG, or WebP image up to 5 MB.</small>
                   </div>
+                  <label>Image URL<input type="text" inputMode="url" maxLength={2048} placeholder="https://example.com/product-image.jpg" value={form.imageUrl} onChange={(event) => setForm({ ...form, imageUrl: event.target.value })} /></label>
                   <div className="medicine-image-picker-row">
                     <div className="medicine-image-preview">
                       {imagePreview
@@ -5286,10 +6020,74 @@ function PharmacyMedicinesScreen({ onCatalogChange, token }: { onCatalogChange: 
           </section>
         </div>
       )}
+      {receiptMedicine && (
+        <div className="medicine-editor-backdrop">
+          <section className="medicine-editor" role="dialog" aria-modal="true" aria-labelledby="stock-receipt-title">
+            <header className="medicine-editor-header">
+              <div className="medicine-editor-brand"><span className="medicine-editor-brand-icon"><Package className="icon" /></span><span>STOCK RECEIPT</span></div>
+              <button type="button" className="medicine-editor-close" aria-label="Close stock receipt" disabled={receiptSaving} onClick={() => setReceiptMedicine(null)}><X className="icon" /></button>
+            </header>
+            <form className="medicine-editor-form" onSubmit={submitStockReceipt}>
+              <div className="medicine-editor-step-heading"><span>{receiptMedicine.name}</span><h4 id="stock-receipt-title">Record supplier receipt</h4></div>
+              {receiptError && <p className="medicine-editor-error" role="alert">{receiptError}</p>}
+              <p className="inventory-note">Each lot can be received once per medicine. Expired stock is recorded for traceability but is excluded from sales.</p>
+              <div className="medicine-editor-fields">
+                <label>Supplier name<input required maxLength={200} value={receiptForm.supplierName} onChange={(event) => setReceiptForm({ ...receiptForm, supplierName: event.target.value })} /></label>
+                <label>Lot / batch number<input required maxLength={100} pattern="[A-Za-z0-9][A-Za-z0-9._/-]*" title="Use letters, numbers, dots, underscores, slashes, or hyphens." value={receiptForm.batchNumber} onChange={(event) => setReceiptForm({ ...receiptForm, batchNumber: event.target.value })} /></label>
+                <label>Received quantity<input required type="number" min="1" max="2147483647" step="1" value={receiptForm.quantityReceived} onChange={(event) => setReceiptForm({ ...receiptForm, quantityReceived: event.target.value })} /></label>
+                <label>Purchase cost per unit (₹)<input required type="number" min="0" max="9999999999.99" step="0.01" value={receiptForm.purchasePrice} onChange={(event) => setReceiptForm({ ...receiptForm, purchasePrice: event.target.value })} /></label>
+                <label>Expiry date<input required type="date" value={receiptForm.expiryDate} onChange={(event) => setReceiptForm({ ...receiptForm, expiryDate: event.target.value })} /></label>
+              </div>
+              <footer className="medicine-editor-actions">
+                <button type="button" className="quiet-action" disabled={receiptSaving} onClick={() => setReceiptMedicine(null)}>Cancel</button>
+                <button type="submit" className="accept-action" disabled={receiptSaving}>{receiptSaving ? 'Recording…' : 'Record receipt'}</button>
+              </footer>
+            </form>
+          </section>
+        </div>
+      )}
+      {countMedicine && (
+        <div className="medicine-editor-backdrop">
+          <section className="medicine-editor" role="dialog" aria-modal="true" aria-labelledby="inventory-count-title">
+            <header className="medicine-editor-header">
+              <div className="medicine-editor-brand"><span className="medicine-editor-brand-icon"><ClipboardList className="icon" /></span><span>INVENTORY COUNT</span></div>
+              <button type="button" className="medicine-editor-close" aria-label="Close inventory count" disabled={countSaving} onClick={() => setCountMedicine(null)}><X className="icon" /></button>
+            </header>
+            <form className="medicine-editor-form" onSubmit={submitInventoryAudit}>
+              <div className="medicine-editor-step-heading"><span>{countMedicine.name}</span><h4 id="inventory-count-title">Count batch inventory</h4></div>
+              {countError && <p className="medicine-editor-error" role="alert">{countError}</p>}
+              <p className="inventory-note">Count physical units and the units verified as sellable. Newly counted units stay blocked unless explicitly verified; expired lots cannot be marked sellable. The signed-in owner is recorded as authorizer.</p>
+              <div className="inventory-count-lines">
+                {countLines.map((line) => (
+                  <fieldset key={line.batchId} className="inventory-count-line">
+                    <legend>{line.batchNumber}{line.isExpired ? ' · Expired' : ''}</legend>
+                    <small>System: {line.systemQuantity} physical · {line.systemSellableQuantity} sellable</small>
+                    <div className="medicine-editor-fields">
+                      <label>Counted physical quantity
+                        <input required type="number" min="0" max="2147483647" step="1" value={line.countedQuantity} onChange={(event) => updateCountLine(line.batchId, 'countedQuantity', event.target.value)} />
+                      </label>
+                      <label>Verified sellable quantity
+                        <input required type="number" min="0" max={line.countedQuantity || '0'} step="1" disabled={line.isExpired} value={line.countedSellableQuantity} onChange={(event) => updateCountLine(line.batchId, 'countedSellableQuantity', event.target.value)} />
+                      </label>
+                    </div>
+                  </fieldset>
+                ))}
+              </div>
+              <label className="inventory-count-reason">Reason for count / discrepancy
+                <textarea required minLength={3} maxLength={1000} rows={3} value={countReason} onChange={(event) => setCountReason(event.target.value)} />
+              </label>
+              <footer className="medicine-editor-actions">
+                <button type="button" className="quiet-action" disabled={countSaving} onClick={() => setCountMedicine(null)}>Cancel</button>
+                <button type="submit" className="accept-action" disabled={countSaving}>{countSaving ? 'Saving count…' : 'Save count session'}</button>
+              </footer>
+            </form>
+          </section>
+        </div>
+      )}
       <div className="inventory-summary">
         <div><span>Products</span><strong>{inventory.length}</strong></div>
-        <div><span>Low stock</span><strong>{inventory.filter((item) => item.stock > 0 && item.stock <= item.reorderLevel).length}</strong></div>
-        <div><span>Out of stock</span><strong>{inventory.filter((item) => item.stock === 0).length}</strong></div>
+        <div><span>Low stock</span><strong>{inventory.filter((item) => item.availableQuantity > 0 && item.availableQuantity <= item.reorderLevel).length}</strong></div>
+        <div><span>Out of stock</span><strong>{inventory.filter((item) => item.availableQuantity === 0).length}</strong></div>
         <div><span>Units on hand</span><strong>{inventory.reduce((sum, item) => sum + item.stock, 0).toLocaleString('en-IN')}</strong></div>
       </div>
       <div className="inventory-filter-bar">
@@ -5309,13 +6107,13 @@ function PharmacyMedicinesScreen({ onCatalogChange, token }: { onCatalogChange: 
             <div className="inventory-main">
               <div className="data-card-heading">
                 <div><h3>{item.name}</h3><p>{item.category} · {item.pack}{item.sku ? ` · ${item.sku}` : ''}</p></div>
-                <span className={item.stock === 0 ? 'danger-tag' : item.stock <= item.reorderLevel ? 'warning-tag' : 'status-pill'}>
-                  {item.stock === 0 ? 'Out of stock' : item.stock <= item.reorderLevel ? 'Low stock' : 'In stock'}
+                <span className={item.availableQuantity === 0 ? 'danger-tag' : item.availableQuantity <= item.reorderLevel ? 'warning-tag' : 'status-pill'}>
+                  {item.availableQuantity === 0 ? (item.stock > 0 ? 'No sellable stock' : 'Out of stock') : item.availableQuantity <= item.reorderLevel ? 'Low stock' : 'In stock'}
                 </span>
               </div>
               <div className="inventory-details">
                 <span>₹{item.price.toLocaleString('en-IN')}</span>
-                <span>{item.stock} units · Alert at {item.reorderLevel}</span>
+                <span>{item.stock} units on hand · {item.availableQuantity} sellable · Alert at {item.reorderLevel}</span>
                 <span>Exp. {item.expiry ? new Date(`${item.expiry.slice(0, 10)}T00:00:00`).toLocaleDateString('en-IN', { month: 'short', year: 'numeric' }) : 'Not set'}</span>
               </div>
               <div className="inventory-metadata-grid">
@@ -5333,18 +6131,50 @@ function PharmacyMedicinesScreen({ onCatalogChange, token }: { onCatalogChange: 
                   <span>{item.stock}</span>
                   <button aria-label={`Increase ${item.name} stock`} onClick={() => void changeStock(item, 1)}><Plus className="icon" /></button>
                 </div>
-                <span className="availability-label"><CircleCheck className="icon" /> {item.stock > 0 ? 'Available' : 'Unavailable'}</span>
+                <span className={`availability-label ${item.availableQuantity === 0 ? 'unavailable' : ''}`}>
+                  <CircleCheck className="icon" /> {item.availableQuantity > 0 ? `${item.availableQuantity} sellable` : 'Unavailable for sale'}
+                </span>
                 <div className="owner-item-actions">
+                  <button type="button" className="quiet-action" onClick={() => void toggleBatchHistory(item)} aria-expanded={expandedBatchMedicineId === item.id}>Batches</button>
+                  <button type="button" className="quiet-action" onClick={() => openStockReceipt(item)}><Plus className="icon" /> Receive stock</button>
                   <button type="button" className="quiet-action" aria-label={`Edit ${item.name}`} onClick={() => startEdit(item)}><Pencil className="icon" /> Edit</button>
                   <button type="button" className="quiet-action danger-action" aria-label={`Archive ${item.name}`} onClick={() => void removeMedicine(item)}><Trash2 className="icon" /> Archive</button>
                 </div>
               </div>
+              {expandedBatchMedicineId === item.id && (
+                <section className="inventory-batch-panel" aria-label={`${item.name} batch history`}>
+                  <div className="inventory-batch-heading">
+                    <h4>Batch history</h4>
+                    <button type="button" className="quiet-action" disabled={!batchRecords[item.id]?.length || batchLoadingMedicineId === item.id} onClick={() => startInventoryCount(item)}>Start count session</button>
+                  </div>
+                  {batchLoadingMedicineId === item.id && <p className="inventory-note">Loading batches…</p>}
+                  {batchLoadError?.medicineId === item.id && <p className="owner-form-error" role="alert">{batchLoadError.message}</p>}
+                  {!batchLoadingMedicineId && batchLoadError?.medicineId !== item.id && batchRecords[item.id]?.length === 0 && (
+                    <p className="inventory-note">No batches have been recorded for this medicine.</p>
+                  )}
+                  {batchRecords[item.id]?.length > 0 && (
+                    <div className="stock-movement-list">
+                      {batchRecords[item.id].map((batch) => (
+                        <article key={batch.id}>
+                          <span className={`stock-movement-icon ${batch.isSellable ? '' : 'decrease'}`}><Package className="icon" /></span>
+                          <div>
+                            <strong>{batch.batchNumber} · {batch.isExpired ? 'Expired — excluded from sales' : batch.isSellable ? (batch.quantityBlocked > 0 ? 'Partially blocked' : 'Sellable') : batch.quantityBlocked > 0 ? 'Blocked — non-sellable' : 'Depleted'}</strong>
+                            <small>{batch.supplierName || 'Supplier not recorded'} · Cost/unit ₹{batch.purchasePrice.toLocaleString('en-IN', { minimumFractionDigits: 2 })} · Expiry {batch.expiryDate ? new Date(`${batch.expiryDate}T00:00:00`).toLocaleDateString('en-IN') : 'Not recorded'}</small>
+                          </div>
+                          <b>{batch.sellableQuantity} sellable · {batch.quantityRemaining - batch.sellableQuantity} non-sellable</b>
+                        </article>
+                      ))}
+                    </div>
+                  )}
+                </section>
+              )}
             </div>
           </article>
         ))}
         {loading && <div className="empty-state-card compact-empty">Loading inventory…</div>}
         {!loading && inventory.length === 0 && <div className="empty-state-card compact-empty">No active medicines yet. Add your first product to start managing stock.</div>}
-        {!loading && inventory.length > 0 && visibleInventory.length === 0 && <div className="empty-state-card compact-empty">No inventory records match those filters.</div>}
+        {!loading && alertFilterLoading && <div className="empty-state-card compact-empty">Loading filtered inventory…</div>}
+        {!loading && !alertFilterLoading && inventory.length > 0 && visibleInventory.length === 0 && <div className="empty-state-card compact-empty">No inventory records match those filters.</div>}
       </div>
       <section className="stock-movement-panel inventory-movement-panel">
         <div className="pharmacy-page-heading"><div><h3>Recent stock movement</h3><p>Receipts, adjustments and order deductions for this pharmacy.</p></div></div>
